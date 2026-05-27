@@ -1,0 +1,31 @@
+qlib_init:
+  provider_uri: "clickhouse://hqy:hqy888@localhost:9000/stock_l2"
+  region: cn
+
+task:
+  model:
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      early_stopping_rounds: 5
+      num_boost_round: 20
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs:
+          start_time: 2025-12-01
+          end_time: 2025-12-20
+          fit_start_time: 2025-12-01
+          fit_end_time: 2025-12-10
+          instruments: ["sz000001"]
+          infer_processors: []
+          learn_processors: []
+      segments:
+        train: [2025-12-01, 2025-12-10]
+        valid: [2025-12-11, 2025-12-15]
+        test: [2025-12-16, 2025-12-20]
