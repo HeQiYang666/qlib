@@ -199,6 +199,16 @@ class ClickHouseFeatureStorage(FeatureStorage):
                 f"GROUP BY {time_label} "
                 f"ORDER BY {time_label}"
             )
+        elif agg_func == "minIf":
+            query = (
+                f"SELECT {time_col} AS {time_label}, "
+                f"  minIf({col_name}, {agg_on}) AS val "
+                f"FROM snapshot_ticks "
+                f"WHERE symbol = %(symbol)s "
+                f"  AND trade_date BETWEEN %(start)s AND %(end)s "
+                f"GROUP BY {time_label} "
+                f"ORDER BY {time_label}"
+            )
         else:
             query = (
                 f"SELECT {time_col} AS {time_label}, "

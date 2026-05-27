@@ -96,14 +96,18 @@ def qlib_symbol_to_ch(qlib_symbol: str) -> str:
     return f"{code}.{market}"
 
 
+_DEFAULT_MULTIPLIERS = {"price": 10000, "amount": 1, "volume": 1}
+
+
 def price_to_float(ch_value: int, field_type: str = "price") -> float:
     """Convert ClickHouse Int64 price/amount to float in yuan.
 
-    Prices: divided by 10000
-    Amounts: divided by 10000
-    Volumes: no conversion
+    Prices (open/high/low/close): stored × 10000
+    Amounts: stored in yuan directly (no multiplier)
+    Volumes: stored in shares (no multiplier)
     """
-    multiplier = C.get("price_multiplier", {}).get(field_type, 10000)
+    default = _DEFAULT_MULTIPLIERS.get(field_type, 10000)
+    multiplier = C.get("price_multiplier", {}).get(field_type, default)
     if multiplier == 1:
         return float(ch_value)
     return ch_value / multiplier
@@ -113,9 +117,9 @@ def price_to_float(ch_value: int, field_type: str = "price") -> float:
 FIELD_MAP = {
     "open": ("open_price", "argMax", "ts", "price"),
     "high": ("high_price", "max", None, "price"),
-    "low": ("low_price", "min", None, "price"),
+    "low": ("low_price", "minIf", "low_price > 0", "price"),
     "close": ("last_price", "argMax", "ts", "price"),
     "volume": ("volume", "sum", None, "volume"),
     "amount": ("amount", "sum", None, "amount"),
-    "vwap": ("amount", "sum", None, "amount"),  # handled specially: sum(amount)/sum(volume)
+    "vwap": ("amount", "sum", None, "volume"),  # sum(amount)/sum(volume) gives price in yuan directly
 }
