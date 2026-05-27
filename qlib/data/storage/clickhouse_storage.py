@@ -22,27 +22,35 @@ class ClickHouseCalendarStorage(CalendarStorage):
 
     @property
     def data(self) -> List[CalVT]:
+        if self.future:
+            raise NotImplementedError(
+                "ClickHouseCalendarStorage does not support future calendar data"
+            )
+
         if self._data_cache is not None:
             return self._data_cache
 
-        client = get_client()
-        if self.freq == "day":
-            query = (
-                "SELECT DISTINCT trade_date "
-                "FROM snapshot_ticks "
-                "ORDER BY trade_date"
-            )
-            rows = client.query(query).result_rows
-            result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d") for r in rows]
-        else:
-            # Minute-level calendar: distinct minute bars
-            query = (
-                "SELECT DISTINCT toStartOfMinute(ts) AS bar "
-                "FROM snapshot_ticks "
-                "ORDER BY bar"
-            )
-            rows = client.query(query).result_rows
-            result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d %H:%M:%S") for r in rows]
+        try:
+            client = get_client()
+            if self.freq == "day":
+                query = (
+                    "SELECT DISTINCT trade_date "
+                    "FROM snapshot_ticks "
+                    "ORDER BY trade_date"
+                )
+                rows = client.query(query).result_rows
+                result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d") for r in rows]
+            else:
+                # Minute-level calendar: distinct minute bars
+                query = (
+                    "SELECT DISTINCT toStartOfMinute(ts) AS bar "
+                    "FROM snapshot_ticks "
+                    "ORDER BY bar"
+                )
+                rows = client.query(query).result_rows
+                result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d %H:%M:%S") for r in rows]
+        except Exception as e:
+            raise ValueError(f"Failed to query calendar data from ClickHouse: {e}") from e
 
         self._data_cache = result
         return result
