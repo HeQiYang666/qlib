@@ -46,13 +46,28 @@ class ProviderBackendMixin:
     It is not necessary to inherent this class if that provider don't rely on the backend storage
     """
 
+    def _get_uri_type(self):
+        """Determine the URI type from provider_uri config."""
+        provider_uri = C.get("provider_uri", "")
+        if isinstance(provider_uri, str):
+            return C.DataPathManager.get_uri_type(provider_uri)
+        elif isinstance(provider_uri, dict):
+            for v in provider_uri.values():
+                if isinstance(v, str) and v.startswith("clickhouse://"):
+                    return C.CLICKHOUSE_URI
+        return None
+
     def get_default_backend(self):
         backend = {}
         provider_name: str = re.findall("[A-Z][^A-Z]*", self.__class__.__name__)[-2]
-        # set default storage class
-        backend.setdefault("class", f"File{provider_name}Storage")
-        # set default storage module
-        backend.setdefault("module_path", "qlib.data.storage.file_storage")
+        uri_type = self._get_uri_type()
+
+        if uri_type == C.CLICKHOUSE_URI:
+            backend.setdefault("class", f"ClickHouse{provider_name}Storage")
+            backend.setdefault("module_path", "qlib.data.storage.clickhouse_storage")
+        else:
+            backend.setdefault("class", f"File{provider_name}Storage")
+            backend.setdefault("module_path", "qlib.data.storage.file_storage")
         return backend
 
     def backend_obj(self, **kwargs):
