@@ -4,7 +4,7 @@ import threading
 from urllib.parse import urlparse, unquote
 from typing import Optional
 
-import clickhouse_connect
+from clickhouse_driver import Client
 
 from qlib.config import C
 from qlib.log import get_module_logger
@@ -12,12 +12,12 @@ from qlib.log import get_module_logger
 logger = get_module_logger("clickhouse_storage")
 
 # Single shared client instance, lazily initialized
-_client: Optional[clickhouse_connect.driver.Client] = None
+_client: Optional[Client] = None
 _lock = threading.Lock()
 
 
 def get_client():
-    """Return a shared clickhouse-connect client. Connects lazily on first call."""
+    """Return a shared clickhouse-driver Client. Connects lazily on first call."""
     global _client
     if _client is not None:
         return _client
@@ -31,10 +31,10 @@ def get_client():
             ch_cfg = _parse_clickhouse_uri(C["provider_uri"])
             C["clickhouse_cache"] = ch_cfg
 
-        _client = clickhouse_connect.get_client(
+        _client = Client(
             host=ch_cfg["host"],
             port=ch_cfg["port"],
-            username=ch_cfg.get("username", "default"),
+            user=ch_cfg.get("username", "default"),
             password=ch_cfg.get("password", ""),
             database=ch_cfg.get("database", "stock_l2"),
             connect_timeout=ch_cfg.get("connect_timeout", 30),
@@ -68,7 +68,7 @@ def _parse_clickhouse_uri(provider_uri) -> dict:
     parsed = urlparse(uri)
     cfg = {
         "host": parsed.hostname or "localhost",
-        "port": parsed.port or 8123,
+        "port": parsed.port or 9000,
         "username": unquote(parsed.username) if parsed.username else "default",
         "password": unquote(parsed.password) if parsed.password else "",
         "database": parsed.path.lstrip("/") or "stock_l2",

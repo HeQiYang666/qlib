@@ -53,7 +53,7 @@ dependencies = [
   "nbconvert",
   "pyarrow",
   "pydantic-settings",
-  "clickhouse-connect",
+  "clickhouse-driver",
   "setuptools-scm",
 ]
 

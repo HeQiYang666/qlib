@@ -38,7 +38,7 @@ class ClickHouseCalendarStorage(CalendarStorage):
                     "FROM snapshot_ticks "
                     "ORDER BY trade_date"
                 )
-                rows = client.query(query).result_rows
+                rows = client.execute(query)
                 result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d") for r in rows]
             else:
                 # Minute-level calendar: distinct minute bars
@@ -47,7 +47,7 @@ class ClickHouseCalendarStorage(CalendarStorage):
                     "FROM snapshot_ticks "
                     "ORDER BY bar"
                 )
-                rows = client.query(query).result_rows
+                rows = client.execute(query)
                 result = [pd.Timestamp(r[0]).strftime("%Y-%m-%d %H:%M:%S") for r in rows]
         except Exception as e:
             raise ValueError(f"Failed to query calendar data from ClickHouse: {e}") from e
@@ -105,7 +105,7 @@ class ClickHouseInstrumentStorage(InstrumentStorage):
                 "GROUP BY symbol "
                 "ORDER BY symbol"
             )
-            rows = client.query(query).result_rows
+            rows = client.execute(query)
 
             result: Dict[InstKT, InstVT] = {}
             for symbol, start_date, end_date in rows:
@@ -216,10 +216,10 @@ class ClickHouseFeatureStorage(FeatureStorage):
             "end": str(pd.Timestamp(end_dt).date()),
         }
         try:
-            result = client.query(query, parameters=params)
-            if result.result_rows:
-                idx = [pd.Timestamp(r[0]) for r in result.result_rows]
-                vals = [price_to_float(r[1], price_type) for r in result.result_rows]
+            result = client.execute(query, params)
+            if result:
+                idx = [pd.Timestamp(r[0]) for r in result]
+                vals = [price_to_float(r[1], price_type) for r in result]
                 return pd.Series(vals, index=idx)
             return pd.Series(dtype=np.float32)
         except Exception as e:
