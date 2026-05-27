@@ -316,6 +316,7 @@ class QlibConfig(Config):
     # URI_TYPE
     LOCAL_URI = "local"
     NFS_URI = "nfs"
+    CLICKHOUSE_URI = "clickhouse"
     DEFAULT_FREQ = "__DEFAULT_FREQ"
 
     def __init__(self, default_conf):
@@ -348,13 +349,18 @@ class QlibConfig(Config):
             else:
                 raise TypeError(f"provider_uri does not support {type(provider_uri)}")
             for freq, _uri in provider_uri.items():
-                if QlibConfig.DataPathManager.get_uri_type(_uri) == QlibConfig.LOCAL_URI:
+                uri_type = QlibConfig.DataPathManager.get_uri_type(_uri)
+                if uri_type == QlibConfig.LOCAL_URI:
                     provider_uri[freq] = str(Path(_uri).expanduser().resolve())
+                elif uri_type == QlibConfig.CLICKHOUSE_URI:
+                    pass  # clickhouse URIs don't need path resolution
             return provider_uri
 
         @staticmethod
         def get_uri_type(uri: Union[str, Path]):
             uri = uri if isinstance(uri, str) else str(uri.expanduser().resolve())
+            if isinstance(uri, str) and uri.startswith("clickhouse://"):
+                return QlibConfig.CLICKHOUSE_URI
             is_win = re.match("^[a-zA-Z]:.*", uri) is not None  # such as 'C:\\data', 'D:'
             # such as 'host:/data/'   (User may define short hostname by themselves or use localhost)
             is_nfs_or_win = re.match("^[^/]+:.+", uri) is not None
@@ -373,6 +379,8 @@ class QlibConfig(Config):
             if freq is None or freq not in self.provider_uri:
                 freq = QlibConfig.DEFAULT_FREQ
             _provider_uri = self.provider_uri[freq]
+            if self.get_uri_type(_provider_uri) == QlibConfig.CLICKHOUSE_URI:
+                return Path(_provider_uri)
             if self.get_uri_type(_provider_uri) == QlibConfig.LOCAL_URI:
                 return Path(_provider_uri)
             elif self.get_uri_type(_provider_uri) == QlibConfig.NFS_URI:
@@ -414,6 +422,8 @@ class QlibConfig(Config):
 
         # resolve
         for _freq in _provider_uri.keys():
+            if self.DataPathManager.get_uri_type(_provider_uri[_freq]) == self.CLICKHOUSE_URI:
+                continue
             # mount_path
             _mount_path[_freq] = (
                 _mount_path[_freq] if _mount_path[_freq] is None else str(Path(_mount_path[_freq]).expanduser())
