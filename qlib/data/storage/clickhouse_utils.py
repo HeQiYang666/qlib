@@ -1,11 +1,10 @@
 # qlib/data/storage/clickhouse_utils.py
 
-import re
+import threading
 from urllib.parse import urlparse, unquote
 from typing import Optional
 
 import clickhouse_connect
-import pandas as pd
 
 from qlib.config import C
 from qlib.log import get_module_logger
@@ -14,6 +13,7 @@ logger = get_module_logger("clickhouse_storage")
 
 # Single shared client instance, lazily initialized
 _client: Optional[clickhouse_connect.driver.Client] = None
+_lock = threading.Lock()
 
 
 def get_client():
@@ -22,18 +22,23 @@ def get_client():
     if _client is not None:
         return _client
 
-    ch_cfg = C.get("clickhouse_cache", {})
-    if not ch_cfg:
-        ch_cfg = _parse_clickhouse_uri(C["provider_uri"])
+    with _lock:
+        if _client is not None:
+            return _client
 
-    _client = clickhouse_connect.get_client(
-        host=ch_cfg["host"],
-        port=ch_cfg["port"],
-        username=ch_cfg.get("username", "default"),
-        password=ch_cfg.get("password", ""),
-        database=ch_cfg.get("database", "stock_l2"),
-        connect_timeout=ch_cfg.get("connect_timeout", 30),
-    )
+        ch_cfg = C.get("clickhouse_cache", {})
+        if not ch_cfg:
+            ch_cfg = _parse_clickhouse_uri(C["provider_uri"])
+            C["clickhouse_cache"] = ch_cfg
+
+        _client = clickhouse_connect.get_client(
+            host=ch_cfg["host"],
+            port=ch_cfg["port"],
+            username=ch_cfg.get("username", "default"),
+            password=ch_cfg.get("password", ""),
+            database=ch_cfg.get("database", "stock_l2"),
+            connect_timeout=ch_cfg.get("connect_timeout", 30),
+        )
     return _client
 
 
@@ -45,10 +50,20 @@ def _parse_clickhouse_uri(provider_uri) -> dict:
     """
     uri = provider_uri
     if isinstance(provider_uri, dict):
+        uri = None
         for v in provider_uri.values():
             if isinstance(v, str) and v.startswith("clickhouse://"):
                 uri = v
                 break
+        if not isinstance(uri, str):
+            raise ValueError(
+                f"provider_uri dict contains no 'clickhouse://' entry; got {provider_uri}"
+            )
+
+    if not isinstance(uri, str):
+        raise ValueError(
+            f"provider_uri must be a dict with a clickhouse:// entry or a clickhouse:// string; got {type(uri).__name__}: {uri}"
+        )
 
     parsed = urlparse(uri)
     cfg = {
@@ -59,7 +74,6 @@ def _parse_clickhouse_uri(provider_uri) -> dict:
         "database": parsed.path.lstrip("/") or "stock_l2",
         "connect_timeout": 30,
     }
-    C["clickhouse_cache"] = cfg
     return cfg
 
 
