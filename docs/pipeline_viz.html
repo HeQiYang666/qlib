@@ -1,770 +1,1438 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RD-Agent × Qlib 因子挖掘流程</title>
-<style>
-  :root {
-    --base: #1e1e2e; --surface0: #313244; --surface1: #45475a;
-    --crust: #11111b; --text: #cdd6f4; --subtext: #a6adc8;
-    --overlay0: #6c7086; --overlay1: #7f849c;
-    --blue: #89b4fa; --green: #a6e3a1; --yellow: #f9e2af;
-    --peach: #fab387; --mauve: #cba6f7; --sky: #89dceb; --red: #f38ba8;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: var(--base); color: var(--text);
-    font-family: -apple-system, 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    display: flex; flex-direction: column; align-items: center;
-    min-height: 100vh; padding: 16px 0;
-  }
-  h1 { font-size: 30px; font-weight: 700; color: var(--text); margin: 0; }
-  h1 span { color: var(--blue); }
-  .subtitle { font-size: 16px; color: var(--overlay0); margin: 4px 0 8px 0; }
-  .rounds {
-    display: inline-flex; gap: 8px; align-items: center; font-size: 13px; color: var(--overlay1);
-    margin-bottom: 4px;
-  }
-  #app {
-    position: relative; width: 1000px; height: 880px;
-    flex-shrink: 0;
-  }
-  #ring-svg { width: 100%; height: 100%; }
-
-  .node-group { cursor: pointer; transition: opacity 0.3s ease; }
-  .node-group:hover { filter: brightness(1.15); }
-  .node-label { pointer-events: none; }
-  .connector { transition: opacity 0.3s ease; }
-
-  #center-bg { transition: stroke 0.3s ease, fill 0.2s ease; }
-
-  .substep-row { cursor: pointer; }
-  .substep-row:hover rect { fill: var(--surface1); }
-  #center-group text, #center-group line, #center-group rect[pointer-events="none"] {
-    pointer-events: none;
-  }
-  #center-group .clickable { pointer-events: auto; cursor: pointer; }
-
-  #center-group * { transition: opacity 0.25s ease; }
-
-  @media (max-width: 920px) {
-    #app { width: 100vw; height: auto; aspect-ratio: 880/620; }
-  }
-</style>
-</head>
-<body>
-
-<h1>RD-Agent <span>×</span> Qlib</h1>
-<p class="subtitle">量化因子自动挖掘流水线 — 点击环形节点深入探索</p>
-<div class="rounds">
-  <span style="color:#a6e3a1">Round 1</span> →
-  <span style="color:#f9e2af">Round 2</span> →
-  <span style="color:#fab387">Round 3</span> →
-  <span style="color:#cba6f7">Round 4</span> →
-  <span style="color:#89dceb">Round 5</span> →
-  <span style="color:#f38ba8">Round 6</span> →
-  <span>...</span>
-</div>
-
-<div id="app">
-  <svg id="ring-svg" viewBox="-500 -440 1000 880" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-      <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-        <path d="M0,0 L8,3 L0,6" fill="#6c7086"/>
-      </marker>
-      <filter id="glow">
-        <feGaussianBlur stdDeviation="2.5" result="blur"/>
-        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-      </filter>
-    </defs>
-    <g id="center-group"></g>
-    <g id="connectors-group"></g>
-    <g id="nodes-group"></g>
-  </svg>
-</div>
-
-<script>
-// ============================================================
-// Content Data
-// ============================================================
-
-const CENTER = {
-  title: "Qlib 回测核心",
-  steps: [
-    { label: "数据加载", detail: "D.features() 加载 OHLCV 数据" },
-    { label: "特征计算", detail: "20 Alpha158 + N 自定义因子" },
-    { label: "DataHandler", detail: "按字母序对齐、去 NaN" },
-    { label: "LGB 训练", detail: "LightGBM train/valid/test" },
-    { label: "策略选股", detail: "Top-K 多头等权配置" },
-    { label: "模拟执行", detail: "Account/Exchange 撮合" },
-    { label: "指标报告", detail: "IC, ICIR, Sharpe, MaxDD" }
-  ]
-};
-
-const STAGES = [
-  {
-    id: "hypothesis", icon: "🤔", label: "提出假设", color: "#a6e3a1",
-    code: "rd_loop.py:_propose",
-    substeps: [
-      { title: "组装历史上下文",
-        detail: {
-          process: "遍历 trace.hist，取出每一轮的 (experiment, feedback) 元组。对每条记录提取：假设文本、因子任务摘要、回测关键指标（IC/年化收益/最大回撤）、反馈意见。通过 prompts.yaml 的 hypothesis_and_feedback 模板拼接为格式化文本，作为 LLM 的历史经验输入。首轮没有历史，直接告知 LLM 'No previous hypothesis available'。",
-          examples: [
-            { title: "trace.hist 结构", code: "// trace.hist 是一个列表，每个元素是 (experiment, feedback) 元组\n[\n  (QlibFactorExperiment_0, HypothesisFeedback_0),\n  (QlibFactorExperiment_1, HypothesisFeedback_1),\n  ...\n]\n\n// 每个 experiment 包含：\n//   .hypothesis — Hypothesis 对象\n//   .sub_tasks — FactorTask 列表\n//   .result — DataFrame (IC, Sharpe, MaxDD 等)\n//\n// 每个 feedback 包含：\n//   .observations — 对结果的观察\n//   .hypothesis_evaluation — 假设是否成立\n//   .decision — 是否替换 SOTA" },
-            { title: "拼接后的上下文示例", code: "=========================================================\n# Trial 1:\n## Hypothesis\n动量因子能捕获短期趋势，预期 IC > 0.03。\n\n## Backtest Result:\nIC: 0.024 | annualized_return: 0.085 | max_drawdown: -0.15\n\nObservation: IC偏低，但年化收益仍为正。\nHypothesis Evaluation: 因子方向正确，但信号强度不足。\nDecision: False\n=========================================================\n# Trial 2:\n..." }
-          ]
-        }
-      },
-      { title: "RAG 策略注入",
-        detail: {
-          process: "根据当前轮次动态注入探索策略。前 15 轮提示 LLM 优先尝试简单、易实现的因子（如价格动量、成交量比率），从多个角度快速覆盖。超过 15 轮后，提示 LLM 尝试复杂因子（如基于机器学习的因子、多维交叉因子）。这个阈值在 factor_proposal.py 的 prepare_context() 中硬编码。",
-          examples: [
-            { title: "前15轮 RAG 策略", code: "RAG: \"Try the easiest and fastest factors to experiment\n      with from various perspectives first.\"" },
-            { title: "15轮后 RAG 策略", code: "RAG: \"Now, you need to try factors that can achieve\n      high IC (e.g., machine learning-based factors).\"" }
-          ]
-        }
-      },
-      { title: "LLM 生成假设",
-        detail: {
-          process: "将组装好的上下文 + RAG 策略 + 输出格式说明发给 LLM。使用的 prompt 模板在 prompts.yaml 的 factor_hypothesis_output_format 和 factor_hypothesis_specification 中定义。规范要求：每轮生成 1-5 个因子的假设、假设要可测试且精确、先简单后复杂、如果连续多轮失败则切换方向。LLM 返回 JSON: {hypothesis, reason}。",
-          examples: [
-            { title: "系统 Prompt (简化)", code: "你是一家顶级对冲基金的首席量化研究员。\n基于历史实验结果，提出新的因子假设。\n\n要求：\n1. 每轮生成 1-5 个因子\n2. 先尝试简单有效的因子\n3. 假设要精确、可测试\n4. 用两到三句话描述\n\n输出 JSON 格式：\n{\"hypothesis\": \"...\", \"reason\": \"...\"}" },
-            { title: "LLM 返回示例", code: "{\n  \"hypothesis\": \"基于过去10日成交量加权平均价与收盘价的偏离度\n              构建反转因子。当偏离度超过2个标准差时，\n              预期未来5日收益会发生均值回归。\",\n  \"reason\": \"量价偏离通常在短期内会修正，\n           此前动量因子已取得正向IC，\n           但波动较大，反转因子可作为互补。\"\n}" }
-          ]
-        }
-      },
-      { title: "解析输出 → Hypothesis 对象",
-        detail: {
-          process: "调用 QlibFactorHypothesisGen.convert_response() 解析 LLM 返回的 JSON 字符串。用 json.loads() 反序列化，提取 hypothesis 和 reason 字段，构造 QlibFactorHypothesis 对象。如果 JSON 解析失败，整个本轮实验会跳过并报错。",
-          examples: [
-            { title: "转换代码", code: "def convert_response(self, response: str) -> Hypothesis:\n    response_dict = json.loads(response)\n    return QlibFactorHypothesis(\n        hypothesis=response_dict[\"hypothesis\"],\n        reason=response_dict[\"reason\"],\n    )" }
-          ]
-        }
-      }
-    ]
-  },
-  {
-    id: "exp_gen", icon: "📝", label: "实验方案", color: "#f9e2af",
-    code: "factor_proposal.py",
-    substeps: [
-      { title: "组装 LLM 上下文",
-        detail: {
-          process: "QlibFactorHypothesis2Experiment.prepare_context() 将以下内容打包：① 当前 hypothesis 文本 ② scenario 描述（数据格式、回测配置、接口说明） ③ 历史 trace 中只包含因子实验的记录（过滤掉模型实验） ④ 输出格式规范。对于首轮，不包含历史信息。",
-          examples: [
-            { title: "上下文字典结构", code: "{\n  \"target_hypothesis\": \"假设文本...\",\n  \"scenario\": \"数据格式: daily_pv.h5...\\n\n              接口: calculate_xxx()...\\n\n              回测: train 2020-2021, test 2022...\",\n  \"hypothesis_and_feedback\": \"# Trial 1: ...\",\n  \"experiment_output_format\": \"JSON schema...\",\n  \"target_list\": [],\n  \"RAG\": null\n}" }
-          ]
-        }
-      },
-      { title: "LLM 生成因子规格",
-        detail: {
-          process: "LLM 根据 hypothesis 将抽象想法转化为具体的因子定义。每个因子必须包含：① name（因子名称）② description（类型+描述，如'[Momentum Factor] 5日价格动量'）③ formulation（LaTeX 数学公式）④ variables（公式中每个变量的含义）。输出格式在 prompts.yaml 的 factor_experiment_output_format 中定义为严格的 JSON schema。",
-          examples: [
-            { title: "LLM 输出的因子规格", code: "{\n  \"Momentum_5d\": {\n    \"description\": \"[Momentum Factor] 5-day simple\n      return based on closing price.\",\n    \"formulation\": \"M_{5d,t} = \\\\frac{C_t}{C_{t-5}} - 1\",\n    \"variables\": {\n      \"C_t\": \"daily closing price ($close)\",\n      \"window\": \"5 trading days\"\n    }\n  },\n  \"Volume_Surge_Ratio_10d\": {\n    \"description\": \"[Volume Factor] Volume surge\n      relative to 10-day average.\",\n    \"formulation\": \"VSR_t = \\\\frac{V_t}{SMA(V,10)}\",\n    \"variables\": {\n      \"V_t\": \"daily volume ($volume)\",\n      \"SMA(V,10)\": \"simple moving average of volume\"\n    }\n  }\n}" }
-          ]
-        }
-      },
-      { title: "去重检查",
-        detail: {
-          process: "遍历 based_experiments（历史所有实验），提取其中所有已实现过的因子名称。新生成的因子名如果在历史中出现过，直接跳过不重复生成。注意：这里只按名字去重，不做数值相关度去重（数值去重发生在因子运行阶段）。如果所有新因子都被去重掉，本次实验只有 SOTA 因子参与回测。",
-          examples: [
-            { title: "去重逻辑", code: "unique_tasks = []\nfor task in tasks:\n    duplicate = False\n    for based_exp in exp.based_experiments:\n        for sub_task in based_exp.sub_tasks:\n            if task.factor_name == sub_task.factor_name:\n                duplicate = True\n                break\n        if duplicate: break\n    if not duplicate:\n        unique_tasks.append(task)\nexp.tasks = unique_tasks" }
-          ]
-        }
-      },
-      { title: "输出 FactorTask 列表",
-        detail: {
-          process: "QlibFactorHypothesis2Experiment.convert_response() 返回 QlibFactorExperiment 对象，其中包含去重后的 FactorTask 列表。每个 FactorTask 携带 factor_name、factor_description、factor_formulation、variables 四个字段，供后续代码生成阶段使用。",
-          examples: [
-            { title: "FactorTask 对象", code: "FactorTask(\n    factor_name=\"Momentum_5d\",\n    factor_description=\"[Momentum Factor] 5-day simple\n      return based on closing price.\",\n    factor_formulation=\"M_{5d,t} = C_t / C_{t-5} - 1\",\n    variables={\"C_t\": \"$close\", \"window\": \"5 days\"}\n)" }
-          ]
-        }
-      }
-    ]
-  },
-  {
-    id: "coding", icon: "💻", label: "代码生成", color: "#fab387",
-    code: "FactorCoSTEER",
-    substeps: [
-      { title: "解析因子规格 → Prompt 参数",
-        detail: {
-          process: "将 FactorTask 的四个字段（name, description, formulation, variables）与 factor_template/ 目录中的模板文件合并。模板提供：① 代码骨架（import 语句、main 函数结构）② 数据格式说明（daily_pv.h5 的列名、索引结构）③ 接口规范（函数命名为 calculate_{name}、输出 result.h5）。合并后的上下文发给 LLM 生成初始代码。",
-          examples: [
-            { title: "模板中的关键接口说明", code: "// 来自 prompts.yaml: qlib_factor_interface\n你的代码需要:\n1. 定义一个 main 函数: calculate_{factor_name}\n2. 在 if __name__ == '__main__' 中调用\n3. 从 daily_pv.h5 读取数据\n4. 计算因子值\n5. 保存到 result.h5 (MultiIndex: datetime, instrument)\n\nCRITICAL: 列名必须用 '$' 前缀 ($close, $open, ...)\n         不能用 'close' 或 'Close'" }
-          ]
-        }
-      },
-      { title: "LLM 生成 factor.py",
-        detail: {
-          process: "LLM 在模板约束下生成完整的 Python 代码。关键要求：① 只使用标准库 + pandas + numpy ② 数据从 daily_pv.h5 读取 ③ 列名带 $ 前缀 ④ 结果写入 result.h5 ⑤ 索引为 (datetime, instrument) MultiIndex ⑥ groupby 操作按 instrument 分组 ⑦ 正确处理滚动窗口（min_periods 参数）。生成的代码不能包含 try-except 块（让外层捕获异常并反馈）。",
-          examples: [
-            { title: "生成的 factor.py 示例", code: "import pandas as pd\nimport numpy as np\n\ndef calculate_Momentum_5d():\n    df = pd.read_hdf('daily_pv.h5', key='data')\n    df = df.sort_index()\n    # 按股票分组计算5日动量\n    df['Momentum_5d'] = df.groupby(\n        'instrument'\n    )['$close'].transform(\n        lambda x: x / x.shift(5) - 1\n    )\n    result = df[['Momentum_5d']]\n    result.to_hdf('result.h5', key='data', mode='w')\n\nif __name__ == '__main__':\n    calculate_Momentum_5d()" }
-          ]
-        }
-      },
-      { title: "CoSTEER 多轮自改进",
-        detail: {
-          process: "CoSTEER (Coding Self-Training with Execution & Evaluation for Refinement) 是因子代码生成的核心质量保证机制。流程：① 执行生成的 factor.py ② 捕获 stdout/stderr/异常 ③ 如果成功，检查 result.h5 格式是否正确（索引、列名、数据类型）④ 如果失败，将错误信息作为反馈发给 LLM ⑤ LLM 根据错误信息修改代码 ⑥ 重新执行 ⑦ 最多重复 N 轮（由配置决定）⑧ 全部失败则标记该因子为未实现。",
-          examples: [
-            { title: "CoSTEER 循环示意", code: "Round 1: 生成代码 → 执行 → KeyError: 'close'\n  → 反馈: \"列名应该是 $close 不是 close\"\n\nRound 2: 修改代码 → 执行 → TypeError: groupby key\n  → 反馈: \"索引需要 reset_index 后再 groupby\"\n\nRound 3: 修改代码 → 执行 → 成功 ✓\n  → 检查 result.h5: MultiIndex(datetime,instrument),\n     column=['Momentum_5d'], dtype=float64 ✓\n  → 保存到 workspace" },
-            { title: "常见错误与修复", code: "| 错误                  | LLM修复方向              |\n|-----------------------|--------------------------|\n| KeyError: 'close'     | 改为 '$close'            |\n| 索引格式不对          | 加 sort_index()          |\n| groupby 报错          | reset_index 后再操作     |\n| result.h5 列名错误    | 确保单列，列名=因子名    |\n| min_periods 缺失      | 加 min_periods=window    |" }
-          ]
-        }
-      },
-      { title: "保存到 workspace",
-        detail: {
-          process: "通过 CoSTEER 验证的 factor.py 存入 workspace.file_dict['factor.py']。每个因子的 workspace 是独立的，对应 exp.sub_workspace_list 中的一个元素。后续 runner 阶段通过遍历 sub_workspace_list 获取所有因子代码并执行。",
-          examples: [
-            { title: "workspace 结构", code: "exp.sub_workspace_list = [\n    FactorFBWorkspace(\n        target_task=FactorTask(\"Momentum_5d\", ...),\n        file_dict={\"factor.py\": \"import pandas...\"}\n    ),\n    FactorFBWorkspace(\n        target_task=FactorTask(\"Volume_Surge_Ratio_10d\", ...),\n        file_dict={\"factor.py\": \"import pandas...\"}\n    ),\n    ...\n]" }
-          ]
-        }
-      }
-    ]
-  },
-  {
-    id: "running", icon: "▶️", label: "因子运行", color: "#cba6f7",
-    code: "factor_runner.py",
-    substeps: [
-      { title: "多进程执行 factor.py",
-        detail: {
-          process: "将所有 factor.py 文件和 daily_pv.h5 数据放入独立的工作目录。使用 multiprocessing_wrapper 并行执行（并行数由 multi_proc_n 配置控制）。每个因子在独立的工作目录中运行：读取 daily_pv.h5 → 计算因子值 → 写入 result.h5。如果某个因子执行失败（超时或异常），不影响其他因子的执行，失败信息记录到 error_message 中。",
-          examples: [
-            { title: "执行流程", code: "// 1. 用 D.features() 导出 OHLCV 数据\nh5_data = D.features(instruments,\n    [\"$open\",\"$close\",\"$high\",\"$low\",\"$volume\",\"$factor\"],\n    freq=\"day\", start=\"2008-01-01\", end=end_date)\nh5_data = h5_data.swaplevel().sort_index()\n\n// 2. 保存为 daily_pv.h5\nh5_data.to_hdf(tmpdir / \"daily_pv.h5\", key=\"data\")\n\n// 3. 每个因子创建独立子目录，symlink daily_pv.h5\nfor factor in factors:\n    work_dir = tmpdir / factor_name\n    os.symlink(h5_path, work_dir / \"daily_pv.h5\")\n\n// 4. 并行执行\nsubprocess.run([python, factor.py], cwd=work_dir, timeout=300)" }
-          ]
-        }
-      },
-      { title: "收集并归一化索引",
-        detail: {
-          process: "遍历所有因子执行结果，读取各自的 result.h5。通过 _normalize_factor_index() 函数统一索引格式：确保每个 result 的索引为标准的 (datetime, instrument) 两层 MultiIndex。过滤掉索引格式不合法、含分钟级数据、datetime 不存在的异常结果。所有合法的因子 DataFrame 加入 factor_dfs 列表，后续用 pd.concat 合并。",
-          examples: [
-            { title: "索引归一化逻辑", code: "def _normalize_factor_index(df):\n    # 必须同时有 datetime 和 instrument 索引\n    if 'datetime' not in df.index.names:\n        return None\n    if 'instrument' not in df.index.names:\n        return None\n    # 提取索引值\n    dt = _resolve_index_level_values(df, 'datetime')\n    inst = _resolve_index_level_values(df, 'instrument')\n    # 重建标准 MultiIndex\n    df.index = pd.MultiIndex.from_arrays(\n        [dt, inst], names=['datetime', 'instrument']\n    )\n    return df" }
-          ]
-        }
-      },
-      { title: "IC 相关度去重",
-        detail: {
-          process: "将 SOTA 因子（历史成功的因子）和新因子拼接为一个 DataFrame。逐对计算每个新因子与每个 SOTA 因子的 IC（Information Coefficient / 相关系数）。对于每个新因子，取它与所有 SOTA 因子的最大 IC。如果 max(IC) ≥ 0.99，说明该新因子与某个已有因子高度线性相关，没有提供额外信息，直接剔除。这个去重发生在因子运行阶段（区别于实验方案阶段的名字去重）。",
-          examples: [
-            { title: "IC去重计算", code: "concat_feature = pd.concat([SOTA, new], axis=1)\n\n# 对每个交易日，计算新因子×SOTA因子的相关系数矩阵\nIC_max = concat_feature.groupby('datetime')\\\n    .apply(lambda x: 各列之间的相关系数)\\\n    .mean()  # 按时间取平均\n\n# 对于新因子j，取它与所有SOTA因子的最大绝对IC\nfor j in range(len(new_factors)):\n    max_ic = max(abs(IC_max[i][j]) for i in SOTA_cols)\n    if max_ic >= 0.99:\n        drop new_factor_j  // 几乎相同，剔除" },
-            { title: "去重示例", code: "SOTA因子库: [Momentum_5d, Volume_Surge_10d]\n新因子: [Price_Momentum_Short, VWAP_Deviation]\n\nIC(Price_Momentum_Short, Momentum_5d) = 0.995\n  → 几乎完全相同 → 剔除 Price_Momentum_Short\n\nIC(VWAP_Deviation, *) = [0.12, 0.08]\n  → max=0.12 < 0.99 → 保留 VWAP_Deviation\n\n最终: [Momentum_5d, Volume_Surge_10d, VWAP_Deviation]" }
-          ]
-        }
-      },
-      { title: "合并保存",
-        detail: {
-          process: "将 SOTA 因子和去重后的新因子用 pd.concat 沿列方向合并。排序索引（sort_index），去重列名（如果有重复列保留最后一个）。列名包装为 MultiIndex ('feature', factor_name) 格式，然后保存为 combined_factors_df.parquet（Parquet 格式比 pickle 兼容性更好）。同时调用 _save_factor_codes() 将所有 factor.py 文件和 factor_info.json 保存到 backtest_results/round_n/factors/ 目录。",
-          examples: [
-            { title: "最终输出", code: "// combined_factors_df.parquet 结构\n                     feature\n                     Momentum_5d  Volume_Surge_10d  VWAP_Deviation\ndatetime   instrument\n2020-01-02 SH600000   0.0231        1.15              -0.0042\n           SZ000001  -0.0156        0.87               0.0113\n...\n\n// factor_info.json\n[\n  {\"name\":\"Momentum_5d\",\"description\":\"...\",\n   \"formulation\":\"...\",\"variables\":{...},\n   \"file\":\"factors/Momentum_5d.py\"},\n  ...\n]\n\n// factors/ 目录\nfactors/\n  Momentum_5d.py\n  Volume_Surge_Ratio_10d.py\n  VWAP_Deviation.py\n  factor_info.json" }
-          ]
-        }
-      }
-    ]
-  },
-  {
-    id: "backtest", icon: "📊", label: "回测评估", color: "#89dceb",
-    code: "workspace.py:execute()",
-    substeps: [
-      { title: "加载特征数据",
-        detail: {
-          process: "Docker 容器内启动 Qlib。通过 Qlib 表达式引擎 D.features() 并行计算 20 个基础 Alpha158 特征（如 CORD10、RESI5、RSQR20 等，均为预定义的数学表达式）。同时从 combined_factors_df.parquet 加载自定义因子。两组特征按列合并，构造完整的特征矩阵。如果存在 SOTA PyTorch 模型，还会加载 model.py。",
-          examples: [
-            { title: "20个 Alpha158 基础特征", code: "// qlib表达式 → 自动并行计算\nBASE_ALPHA158 = {\n  \"CORD10\": \"Corr($close/Ref($close,1),\n              Log($volume/Ref($volume,1)+1), 10)\",\n  \"RESI5\": \"Resi($close, 5)/$close\",\n  \"RSQR20\": \"Rsquare($close, 20)\",\n  \"STD5\": \"Std($close, 5)/$close\",\n  \"WVMA60\": \"Std(Abs($close/Ref($close,1)-1)*$volume,60)\n              /(Mean(...)+1e-12)\",\n  ... // 共20个\n}\n\n// 执行\nfeatures = D.features(instruments, expressions,\n                       start_time, end_time)" },
-            { title: "特征矩阵合并", code: "// Alpha158 特征 (20列)\nbase_df  = D.features(instruments, alpha158_exprs, ...)\n\n// 自定义因子 (来自 combined_factors_df.parquet)\ncustom_df = pd.read_parquet('combined_factors_df.parquet')\n\n// 合并: 按 (datetime, instrument) 对齐\nfull_features = pd.concat([base_df, custom_df], axis=1)" }
-          ]
-        }
-      },
-      { title: "DataHandler 处理",
-        detail: {
-          process: "DataHandlerLP 是 Qlib 的标准数据处理流水线。它执行以下操作：① 将所有特征列按字母序排列（这是 critical 的行为——训练和预测必须一致）② 计算标签（Label）：未来第2个交易日的收益率，即 Ref($close, -2) / $close - 1 ③ 去除包含 NaN 的行（dropna）④ 按时间划分 train/valid/test 三个数据集（如 train: 2020-2021, valid: 2022 Q1, test: 2022 Q2-2023）⑤ 标准化/归一化处理（可选）。",
-          examples: [
-            { title: "DataHandlerLP 配置", code: "// conf_combined_factors.yaml\nhandler:\n    class: DataHandlerLP\n    module_path: qlib.contrib.data.handler\n    kwargs:\n        start_time: \"2020-01-01\"\n        end_time: \"2023-12-31\"\n        fit_start_time: \"2020-01-01\"\n        fit_end_time: \"2022-06-30\"\n        instruments: \"csi300\"\n        # Alpha158 + 自定义因子的表达式列表\n        # DataHandlerLP 自动按字母序排列" },
-            { title: "字母序排列的重要性", code: "// 训练时特征顺序（字母序）:\n// CORD10, CORD5, CORD60, CORR10, CORR20, CORR5,\n// CORR60, KLEN, KLOW, Momentum_5d, RESI10, RESI5,\n// ROC60, RSQR10, RSQR20, RSQR5, RSQR60, STD5,\n// Volume_Surge_Ratio_10d, VSTD5, WVMA5, WVMA60\n\n// LightGBM booster 按此顺序记住了 feature_id\n// 预测时如果顺序不同 → 结果完全错误" }
-          ]
-        }
-      },
-      { title: "LightGBM 训练",
-        detail: {
-          process: "使用 LightGBM 的回归模式训练模型。输入是特征矩阵 X，目标是未来收益 Label y。默认使用 conf_combined_factors.yaml 中的参数配置（如 num_leaves=32, learning_rate=0.05, n_estimators=500, early_stopping=50）。训练时监控 valid 集的损失，提前停止防止过拟合。如果存在此前的 SOTA PyTorch 模型，则使用 conf_combined_factors_sota_model.yaml 配置来训练 PyTorch 模型而非 LightGBM。",
-          examples: [
-            { title: "LightGBM 参数", code: "// conf_combined_factors.yaml 中的模型配置\nmodel:\n    class: LGBModel\n    module_path: qlib.contrib.model.lgb\n    kwargs:\n        loss: mse\n        colsample_bytree: 0.8\n        learning_rate: 0.05\n        num_leaves: 32\n        n_estimators: 500\n        early_stopping_rounds: 50\n        seed: 42" }
-          ]
-        }
-      },
-      { title: "生成预测信号",
-        detail: {
-          process: "训练好的 LightGBM booster（或 PyTorch 模型）对测试集每个交易日、每只股票产生一个预测 score。score 是模型对未来收益的点估计，值越大表示预期收益越高。每个交易日对所有股票的 score 进行排名，生成 cross-sectional 排序信号。",
-          examples: [
-            { title: "预测输出", code: "// 测试集预测结果\n                     score\ndatetime   instrument\n2023-01-03 SH600000   0.0234\n           SZ000001  -0.0056\n           SH600519   0.0412\n           SZ300750   0.0189\n           ...\n// score > 0 → 预期未来上涨\n// score < 0 → 预期未来下跌\n// 每日排名: 选 score 最高的 top-K 只" }
-          ]
-        }
-      },
-      { title: "策略执行",
-        detail: {
-          process: "Top-K 多头策略：每个交易日，选取预测 score 最高的 K 只股票（默认 K=50 或总股票数的 20%），等权配置资金。可以设置是否允许做空、是否考虑交易成本、单只股票最大权重等约束。Qlib 的策略框架通过 BaseStrategy.generate_trade_decision() 生成交易决策，返回 Order 列表。",
-          examples: [
-            { title: "策略配置", code: "// Top-K 策略参数\nstrategy:\n    class: TopkDropoutStrategy\n    module_path: qlib.contrib.strategy\n    kwargs:\n        topk: 50          # 选50只\n        n_drop: 5         # 每天最多换5只\n        risk_degree: 0.95 # 风险厌恶系数" }
-          ]
-        }
-      },
-      { title: "模拟交易 & 报告",
-        detail: {
-          process: "Qlib 的 Exchange 组件模拟真实市场环境：按当日成交价撮合、扣除交易成本（佣金+滑点）、处理涨跌停限制。Account 和 Position 追踪资金和持仓变化。每笔交易的 PnL 累积形成组合收益曲线。最终自动计算 20+ 回测指标：IC（当日 score 与未来收益的相关系数）、ICIR（IC均值/IC标准差）、Rank IC（秩相关系数）、年化收益、夏普比率、信息比率、最大回撤、换手率等，写入 qlib_res.csv。",
-          examples: [
-            { title: "qlib_res.csv 关键指标", code: "IC                           0.0461\nICIR                         0.6321\nRank IC                      0.0192\nRank ICIR                    0.2295\n1day.excess_return_with_cost.annualized_return   0.1331\n1day.excess_return_with_cost.information_ratio   0.6894\n1day.excess_return_with_cost.max_drawdown       -0.2432\n1day.excess_return_without_cost.annualized_return 0.2263\n1day.excess_return_without_cost.max_drawdown     -0.2407\n1day.excess_return_without_cost.information_ratio 1.1723" }
-          ]
-        }
-      }
-    ]
-  },
-  {
-    id: "feedback", icon: "💡", label: "反馈学习", color: "#f38ba8",
-    code: "feedback.py",
-    substeps: [
-      { title: "提取关键指标",
-        detail: {
-          process: "从 qlib_res.csv 中提取三个核心指标用于反馈判断：IC（因子预测能力）、1day.excess_return_with_cost.annualized_return（含成本的年化超额收益）、1day.excess_return_with_cost.max_drawdown（含成本的最大回撤）。这三个指标在 feedback.py 的 IMPORTANT_METRICS 列表中定义。同时提取 SOTA（当前最优）的对应指标用于对比。",
-          examples: [
-            { title: "指标提取代码", code: "IMPORTANT_METRICS = [\n    \"IC\",\n    \"1day.excess_return_with_cost.annualized_return\",\n    \"1day.excess_return_with_cost.max_drawdown\",\n]\n\ncurrent_values = result.loc[IMPORTANT_METRICS]\nsota_values = sota_result.loc[IMPORTANT_METRICS]" }
-          ]
-        }
-      },
-      { title: "对比 SOTA 结果",
-        detail: {
-          process: "将当前实验结果与 SOTA 结果并排对比。对每个指标计算差值，格式化为 LLM 可读的文本（如 'IC of Current Result is 0.046, of SOTA Result is 0.041'）。这个对比文本是 LLM 反馈生成的核心输入，帮助 LLM 判断新因子是否带来了实质性改进。",
-          examples: [
-            { title: "对比输出", code: "IC of Current Result is 0.046118, of SOTA Result is 0.041234;\nannualized_return of Current Result is 0.133067, of SOTA Result is 0.125400;\nmax_drawdown of Current Result is -0.243158, of SOTA Result is -0.251000" }
-          ]
-        }
-      },
-      { title: "LLM 分析反馈",
-        detail: {
-          process: "将场景描述 + 假设文本 + 因子详情 + 指标对比 打包发给 LLM。LLM 扮演专业量化分析助理的角色，需要输出：① Observations（对结果的客观观察）② Feedback for Hypothesis（假设是否得到验证）③ New Hypothesis（新的改进方向）④ Reasoning（推理过程）⑤ Replace Best Result（是否替换 SOTA，yes/no）。Response 要求 JSON 格式。",
-          examples: [
-            { title: "反馈 Prompt（简化）", code: "System: 你是专业量化分析助理。\n基于回测结果，判断假设是否成立，提出改进方向。\n\n判断标准:\n1. 年化收益有提升 → 建议替换 SOTA\n2. 其他指标小幅波动可接受\n3. 显著差于 SOTA → 建议换方向\n\nUser: 假设: {hypothesis}\n因子: {factor_details}\n结果对比: {combined_result}\n\n请输出 JSON:\n{\n  \"Observations\": \"...\",\n  \"Feedback for Hypothesis\": \"...\",\n  \"New Hypothesis\": \"...\",\n  \"Reasoning\": \"...\",\n  \"Replace Best Result\": \"yes/no\"\n}" },
-            { title: "LLM 返回示例", code: "{\n  \"Observations\": \"IC 从 0.041 提升到 0.046，\n    年化收益从 12.5% 提升到 13.3%。\n    但最大回撤略有扩大。\",\n  \"Feedback for Hypothesis\": \"假设基本成立，\n    成交量加权反转因子确实提供了增量信息。\",\n  \"New Hypothesis\": \"在反转因子基础上，\n    加入波动率过滤条件，\n    有望在控制回撤的同时保持收益。\",\n  \"Reasoning\": \"收益提升但回撤扩大，\n    说明因子在高波动时期表现较差，\n    需要波动率过滤来改善风险调整后收益。\",\n  \"Replace Best Result\": \"yes\"\n}" }
-          ]
-        }
-      },
-      { title: "SOTA 替换判断",
-        detail: {
-          process: "LLM 返回的 Replace Best Result 字段决定了当前结果是否成为新的 SOTA（State of the Art）。判断核心标准：年化收益（annualized_return）有提升即建议替换。微小波动（如回撤略有扩大但收益提升显著）可以接受。如果确定为 SOTA，当前实验的所有因子进入 SOTA 因子库，后续轮次自动包含。",
-          examples: [
-            { title: "替换决策流程", code: "if response[\"Replace Best Result\"] == \"yes\":\n    # 当前结果 → 新的 SOTA\n    # 当前因子 → 进入 SOTA 因子库\n    # 下一轮 baseline = 当前实验\n    sota = current_experiment\nelse:\n    # 保持原有 SOTA\n    # 当前因子不进入因子库\n    # 下一轮 baseline = 原来的 SOTA" }
-          ]
-        }
-      },
-      { title: "写入 trace.hist",
-        detail: {
-          process: "rd_loop.py 的 record() 方法将 (experiment, feedback) 元组追加到 trace.hist 列表。同时调用 trace.sync_dag_parent_and_hist() 更新 DAG（有向无环图）结构，记录实验之间的父子关系（如哪个实验是基于哪个 SOTA 做的改进）。trace 对象在下一轮 _propose() 时作为历史上下文传入 LLM，形成闭环的持续学习。",
-          examples: [
-            { title: "trace 循环", code: "// Round 1\n_propose() → 读取 trace.hist = []  (空)\n  → 生成初始假设\n  → 实验 → 反馈\n  → record() → trace.hist = [(exp1, fb1)]\n\n// Round 2\n_propose() → 读取 trace.hist = [(exp1, fb1)]\n  → 基于 Round1 的经验生成新假设\n  → 实验 → 反馈\n  → record() → trace.hist = [(exp1, fb1), (exp2, fb2)]\n\n// Round N\n_propose() → 读取前 N-1 轮的所有经验\n  → 综合历史教训，生成最优假设" }
-          ]
-        }
-      }
-    ]
-  }
-];
-
-// ============================================================
-// Layout Constants
-// ============================================================
-
-const RING_R = 230, NODE_R = 32;
-const CX = 0, CY = 0;
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-let currentStage = null;
-let expandedIdx = null;
-let expandedExampleCodes = new Set();
-const MAX_CARD_H = 240;
-
-// ============================================================
-// Helpers
-// ============================================================
-
-function $el(tag, attrs) {
-  const el = document.createElementNS(SVG_NS, tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "textContent") el.textContent = v;
-    else if (k === "innerHTML") el.innerHTML = v;
-    else if (k.startsWith("on")) {
-      const ev = k.slice(2).toLowerCase();
-      el.addEventListener(ev, v);
-    } else {
-      el.setAttribute(k, v);
-    }
-  }
-  return el;
-}
-
-function wrapText(text, maxLen) {
-  const lines = [];
-  let cur = "";
-  for (const w of text.split(" ")) {
-    if ((cur + " " + w).length > maxLen && cur) { lines.push(cur.trim()); cur = w; }
-    else { cur += " " + w; }
-  }
-  if (cur.trim()) lines.push(cur.trim());
-  return lines;
-}
-
-// ============================================================
-// Detail Card Helpers
-// ============================================================
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function estimateLines(text) {
-  // Estimate wrapped lines at 13px font (~32 CJK chars/line in card)
-  return Math.max(1, Math.ceil(text.length / 32));
-}
-
-function getCardHeight(stage, substepIdx) {
-  const d = stage.substeps[substepIdx].detail;
-  const processH = estimateLines(d.process) * 16 + 16;
-  let examplesH = 24;
-  d.examples.forEach((ex, i) => {
-    const key = `${stage.id}-${substepIdx}-${i}`;
-    examplesH += 26;
-    if (expandedExampleCodes.has(key)) {
-      examplesH += ex.code.split("\n").length * 14 + 24;
-    }
-  });
-  return Math.min(44 + processH + examplesH, MAX_CARD_H);
-}
-
-window._toggleEx = function(key) {
-  if (expandedExampleCodes.has(key)) {
-    expandedExampleCodes.delete(key);
-  } else {
-    expandedExampleCodes.add(key);
-  }
-  if (currentStage) renderCenterSubSteps(currentStage);
-};
-
-// ============================================================
-// Ring Rendering
-// ============================================================
-
-function renderRing(activeId) {
-  const nodesG = document.getElementById("nodes-group");
-  const connG = document.getElementById("connectors-group");
-  nodesG.innerHTML = "";
-  connG.innerHTML = "";
-
-  const n = STAGES.length;
-
-  STAGES.forEach((s, i) => {
-    const angle = -Math.PI / 2 + (2 * Math.PI * i) / n;
-    const x = CX + RING_R * Math.cos(angle);
-    const y = CY + RING_R * Math.sin(angle);
-    const isActive = activeId === s.id;
-    const opacity = (activeId && !isActive) ? 0.3 : 1;
-
-    // Connector arc to next node
-    const nextI = (i + 1) % n;
-    const nextAngle = -Math.PI / 2 + (2 * Math.PI * nextI) / n;
-    const rConn = RING_R - NODE_R - 10;
-    const ax = CX + rConn * Math.cos(angle);
-    const ay = CY + rConn * Math.sin(angle);
-    const bx = CX + rConn * Math.cos(nextAngle);
-    const by = CY + rConn * Math.sin(nextAngle);
-    const largeArc = (nextAngle - angle + 2*Math.PI) % (2*Math.PI) > Math.PI ? 1 : 0;
-    connG.appendChild($el("path", {
-      d: `M${ax},${ay} A${rConn},${rConn} 0 ${largeArc},1 ${bx},${by}`,
-      fill: "none", stroke: "#6c7086", "stroke-width": "1.2",
-      "marker-end": "url(#arrow)", opacity, class: "connector"
-    }));
-
-    // Node group
-    const g = $el("g", {
-      transform: `translate(${x},${y})`, opacity, class: "node-group ring-node",
-      onclick: (e) => { e.stopPropagation(); showLevel2(s.id); }
-    });
-
-    if (isActive) {
-      g.appendChild($el("circle", { r: NODE_R + 8, fill: "none", stroke: s.color, "stroke-width": "3", opacity: "0.4", filter: "url(#glow)" }));
-    }
-
-    g.appendChild($el("circle", { r: NODE_R, fill: s.color, opacity: isActive ? "1" : "0.85" }));
-    g.appendChild($el("text", { "text-anchor": "middle", dy: "0.35em", fill: "#1e1e2e", "font-size": "24", "font-family": "sans-serif", textContent: s.icon }));
-
-    // Label
-    g.appendChild($el("text", {
-      y: NODE_R + 25, "text-anchor": "middle", fill: isActive ? s.color : "#6c7086",
-      "font-size": "16", class: "node-label", textContent: s.label
-    }));
-
-    nodesG.appendChild(g);
-  });
-}
-
-// ============================================================
-// Center Area Rendering
-// ============================================================
-
-function bgRect(w, h, strokeColor, topY) {
-  const y = (topY !== undefined) ? topY : -h/2;
-  return $el("rect", {
-    x: -w/2, y: y, width: w, height: h, rx: 14,
-    fill: "#313244", stroke: strokeColor || "#89b4fa", "stroke-width": "1.5",
-    "pointer-events": "none"  // allow clicks to pass through to ring nodes behind
-  });
-}
-
-function renderCenterDefault() {
-  const g = document.getElementById("center-group");
-  g.innerHTML = "";
-  currentStage = null;
-  expandedIdx = null;
-
-  const W = 540, H = 290;
-  g.appendChild(bgRect(W, H, "#89b4fa"));
-
-  g.appendChild($el("text", {
-    x: 0, y: -115, "text-anchor": "middle", fill: "#89b4fa",
-    "font-size": "22", "font-weight": "bold", textContent: CENTER.title
-  }));
-
-  const steps = CENTER.steps;
-  const sw = 68, gap = 6;
-  const totalW = steps.length * sw + (steps.length - 1) * gap;
-  const sx0 = -totalW / 2;
-
-  steps.forEach((s, i) => {
-    const sx = sx0 + i * (sw + gap);
-    g.appendChild($el("rect", { x: sx, y: -50, width: sw, height: 90, rx: 6, fill: "#45475a" }));
-    g.appendChild($el("text", {
-      x: sx + sw/2, y: -20, "text-anchor": "middle", fill: "#cdd6f4", "font-size": "13", textContent: s.label
-    }));
-
-    if (i < steps.length - 1) {
-      g.appendChild($el("text", {
-        x: sx + sw + gap/2, y: 4, "text-anchor": "middle", fill: "#6c7086", "font-size": "16",
-        textContent: "→"
-      }));
-    }
-  });
-
-  g.appendChild($el("text", {
-    x: 0, y: 88, "text-anchor": "middle", fill: "#6c7086", "font-size": "14",
-    textContent: "点击外环节点查看详情"
-  }));
-}
-
-function renderCenterSubSteps(stage) {
-  const g = document.getElementById("center-group");
-  g.innerHTML = "";
-
-  const W = 540;
-  const hasCard = expandedIdx !== null;
-  const subCount = stage.substeps.length;
-  const rowH = 42, startY = -82;
-  const cardH = hasCard ? getCardHeight(stage, expandedIdx) : 0;
-
-  // Pin bg top at fixed Y, grow downward only as card expands
-  const fixedTop = -160;
-  const bottomContentY = hasCard
-    ? startY + subCount * rowH + 14 + cardH + 14    // card bottom + margin
-    : startY + subCount * rowH + 30;                // tip text below substeps
-  const H = bottomContentY - fixedTop;
-  g.appendChild(bgRect(W, H, stage.color, fixedTop));
-
-  // Transparent click-catcher — swallows clicks to prevent pass-through
-  // to ring nodes behind (bg has pointer-events: none). Rendered before
-  // interactive elements so they stay on top.
-  g.appendChild($el("rect", {
-    x: -W/2, y: fixedTop, width: W, height: H, rx: 14,
-    fill: "transparent"
-  }));
-
-  const LX = -W/2 + 10, RX = W/2 - 10;
-
-  // Breadcrumb with clickable "back" link
-  const bcGroup = $el("g", {
-    onclick: (e) => { e.stopPropagation(); showLevel1(); },
-    style: "cursor:pointer;"
-  });
-  bcGroup.appendChild($el("rect", {
-    x: LX, y: -150, width: 80, height: 20, rx: 4, fill: "transparent"
-  }));
-  bcGroup.appendChild($el("text", {
-    x: LX, y: -136, fill: "#89b4fa", "font-size": "14",
-    textContent: "← 返回总览"
-  }));
-  g.appendChild(bcGroup);
-
-  g.appendChild($el("text", {
-    x: LX + 100, y: -136, fill: "#6c7086", "font-size": "14",
-    innerHTML: `&gt; <tspan fill="${stage.color}">${stage.icon} ${stage.label}</tspan>`
-  }));
-
-  // Title
-  g.appendChild($el("text", {
-    x: LX, y: -110, fill: stage.color, "font-size": "22", "font-weight": "bold",
-    textContent: `${stage.icon} ${stage.label}`
-  }));
-
-  // Code ref (top right)
-  g.appendChild($el("text", {
-    x: RX, y: -110, "text-anchor": "end", fill: "#585b70", "font-size": "10",
-    "font-family": "monospace", textContent: stage.code
-  }));
-
-  // Divider
-  g.appendChild($el("line", { x1: LX, x2: RX, y1: -96, y2: -96, stroke: "#45475a", "stroke-width": "1" }));
-
-  // Sub-steps
-  stage.substeps.forEach((ss, i) => {
-    const y = startY + i * rowH;
-    const exp = expandedIdx === i;
-
-    // Row bg
-    g.appendChild($el("rect", {
-      x: LX, y, width: W - 20, height: rowH, rx: 5, fill: exp ? "#45475a" : "transparent",
-      class: "substep-row", onclick: (e) => { e.stopPropagation(); toggleSubstep(i); }
-    }));
-
-    // Number
-    g.appendChild($el("text", {
-      x: LX + 10, y: y + 28, fill: stage.color, "font-size": "16",
-      textContent: `${i + 1}.`
-    }));
-
-    // Title
-    g.appendChild($el("text", {
-      x: LX + 32, y: y + 28, fill: "#cdd6f4", "font-size": "16",
-      textContent: ss.title
-    }));
-
-    // Indicator
-    g.appendChild($el("text", {
-      x: RX, y: y + 28, "text-anchor": "end", fill: "#6c7086", "font-size": "16",
-      textContent: exp ? "▾" : "▸"
-    }));
-
-    // Divider between rows
-    if (i < stage.substeps.length - 1) {
-      g.appendChild($el("line", {
-        x1: LX + 10, x2: RX, y1: y + rowH + 1, y2: y + rowH + 1,
-        stroke: "#45475a", "stroke-width": "0.5"
-      }));
-    }
-  });
-
-  // Detail card if expanded
-  if (expandedIdx !== null && stage.substeps[expandedIdx]) {
-    renderDetailCard(stage, stage.substeps[expandedIdx], startY + stage.substeps.length * rowH + 14);
-  }
-
-  // Bottom tip — only show when card is not expanded (redundant otherwise)
-  if (!hasCard) {
-    g.appendChild($el("text", {
-      x: 0, y: bottomContentY - 10, "text-anchor": "middle", fill: "#6c7086", "font-size": "13",
-      textContent: "点击子步骤展开详情  ·  点击 ← 返回总览 返回总览"
-    }));
-  }
-}
-
-function renderDetailCard(stage, substep, cardTop) {
-  const g = document.getElementById("center-group");
-  const d = substep.detail;
-  const LX = -256, RW = 512;
-  const displayH = getCardHeight(stage, expandedIdx);
-
-  // Card group stops propagation
-  const cardG = $el("g", { onclick: (e) => { e.stopPropagation(); } });
-  g.appendChild(cardG);
-
-  cardG.appendChild($el("rect", {
-    x: LX, y: cardTop, width: RW, height: displayH, rx: 8,
-    fill: "#1e1e2e", stroke: stage.color, "stroke-width": "0.8"
-  }));
-
-  // foreignObject for rich HTML content with scrolling
-  const fo = document.createElementNS(SVG_NS, "foreignObject");
-  fo.setAttribute("x", LX + 4);
-  fo.setAttribute("y", cardTop + 4);
-  fo.setAttribute("width", RW - 8);
-  fo.setAttribute("height", displayH - 8);
-
-  let html = '<div xmlns="http://www.w3.org/1999/xhtml" style="padding:10px 12px;color:#cdd6f4;font-size:13px;line-height:1.5;font-family:-apple-system,\'Noto Sans SC\',\'PingFang SC\',\'Microsoft YaHei\',sans-serif;height:100%;overflow-y:auto;box-sizing:border-box;" onclick="event.stopPropagation()">';
-
-  // Section: Process
-  html += '<div style="color:' + stage.color + ';font-weight:bold;font-size:14px;margin-bottom:6px;">📋 详细流程</div>';
-  html += '<p style="color:#a6adc8;font-size:13px;line-height:1.65;margin:0 0 12px 0;">' + escHtml(d.process) + '</p>';
-
-  // Section: Examples
-  html += '<div style="color:#6c7086;font-size:11px;margin-bottom:6px;">📎 代码示例（点击展开）</div>';
-
-  d.examples.forEach((ex, i) => {
-    const key = stage.id + '-' + expandedIdx + '-' + i;
-    const exp = expandedExampleCodes.has(key);
-    html += '<div onclick="event.stopPropagation();window._toggleEx(\'' + key + '\')" style="background:' + (exp ? '#45475a' : '#313244') + ';border-radius:4px;padding:5px 8px;margin-bottom:3px;cursor:pointer;font-size:12px;color:#cdd6f4;">' + (exp ? '▾' : '▸') + ' ' + escHtml(ex.title) + '</div>';
-    if (exp) {
-      html += '<pre style="background:#11111b;color:#a6adc8;padding:8px 10px;border-radius:4px;margin:0 0 5px 0;font-size:10px;line-height:1.35;overflow-x:auto;white-space:pre-wrap;font-family:\'SF Mono\',\'Fira Code\',\'Cascadia Code\',monospace;">' + escHtml(ex.code) + '</pre>';
-    }
-  });
-
-  html += '</div>';
-  fo.innerHTML = html;
-  cardG.appendChild(fo);
-}
-
-// ============================================================
-// Level Navigation
-// ============================================================
-
-function setLayerOrder(centerOnTop) {
-  const svg = document.getElementById("ring-svg");
-  const centerG = document.getElementById("center-group");
-  const connG = document.getElementById("connectors-group");
-  const nodesG = document.getElementById("nodes-group");
-  if (centerOnTop) {
-    // center on top: nodes → connectors → center (center rendered last = on top)
-    svg.insertBefore(connG, centerG);
-    svg.insertBefore(nodesG, connG);
-  } else {
-    // ring on top: center → connectors → nodes
-    svg.insertBefore(connG, nodesG);
-    svg.insertBefore(centerG, connG);
-  }
-}
-
-function showLevel1() {
-  currentStage = null;
-  expandedIdx = null;
-  setLayerOrder(false); // ring on top
-  renderRing(null);
-  renderCenterDefault();
-}
-
-function showLevel2(stageId) {
-  currentStage = STAGES.find(s => s.id === stageId);
-  expandedIdx = null;
-  setLayerOrder(true); // center on top
-  renderRing(stageId);
-  renderCenterSubSteps(currentStage);
-}
-
-function toggleSubstep(idx) {
-  if (expandedIdx === idx) {
-    expandedIdx = null;
-  } else {
-    expandedIdx = idx;
-    expandedExampleCodes.clear();
-  }
-  if (currentStage) renderCenterSubSteps(currentStage);
-}
-
-// ============================================================
-// Init
-// ============================================================
-
-showLevel1();
-</script>
-
-</body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>RD-Agent × Qlib 因子挖掘流程</title>
+        <style>
+            :root {
+                --base: #1e1e2e;
+                --surface0: #313244;
+                --surface1: #45475a;
+                --crust: #11111b;
+                --text: #cdd6f4;
+                --subtext: #a6adc8;
+                --overlay0: #6c7086;
+                --overlay1: #7f849c;
+                --blue: #89b4fa;
+                --green: #a6e3a1;
+                --yellow: #f9e2af;
+                --peach: #fab387;
+                --mauve: #cba6f7;
+                --sky: #89dceb;
+                --red: #f38ba8;
+            }
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: var(--base);
+                color: var(--text);
+                font-family:
+                    -apple-system, "Noto Sans SC", "PingFang SC",
+                    "Microsoft YaHei", sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                min-height: 100vh;
+                padding: 16px 0;
+            }
+            h1 {
+                font-size: 30px;
+                font-weight: 700;
+                color: var(--text);
+                margin: 0;
+            }
+            h1 span {
+                color: var(--blue);
+            }
+            .subtitle {
+                font-size: 16px;
+                color: var(--overlay0);
+                margin: 4px 0 8px 0;
+            }
+            .rounds {
+                display: inline-flex;
+                gap: 8px;
+                align-items: center;
+                font-size: 13px;
+                color: var(--overlay1);
+                margin-bottom: 4px;
+            }
+            #app {
+                position: relative;
+                width: 900px;
+                height: 880px;
+                flex-shrink: 0;
+            }
+            #ring-svg {
+                width: 100%;
+                height: 100%;
+            }
+
+            .node-group {
+                cursor: pointer;
+                transition: opacity 0.3s ease;
+            }
+            .node-group:hover {
+                filter: brightness(1.15);
+            }
+            .node-label {
+                pointer-events: none;
+            }
+            .connector {
+                transition: opacity 0.3s ease;
+            }
+
+            #center-bg {
+                transition:
+                    stroke 0.3s ease,
+                    fill 0.2s ease;
+            }
+
+            .substep-row {
+                cursor: pointer;
+            }
+            .substep-row:hover rect {
+                fill: var(--surface1);
+            }
+            #center-group text,
+            #center-group line,
+            #center-group rect[pointer-events="none"] {
+                pointer-events: none;
+            }
+            #center-group .clickable {
+                pointer-events: auto;
+                cursor: pointer;
+            }
+
+            #center-group * {
+                transition: opacity 0.25s ease;
+            }
+
+            @media (max-width: 920px) {
+                #app {
+                    width: 100vw;
+                    height: auto;
+                    aspect-ratio: 900/880;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <h1>RD-Agent <span>×</span> Qlib</h1>
+        <p class="subtitle">量化因子自动挖掘流水线 — 点击环形节点深入探索</p>
+        <div class="rounds">
+            <span style="color: #a6e3a1">Round 1</span> →
+            <span style="color: #f9e2af">Round 2</span> →
+            <span style="color: #fab387">Round 3</span> →
+            <span style="color: #cba6f7">Round 4</span> →
+            <span style="color: #89dceb">Round 5</span> →
+            <span style="color: #f38ba8">Round 6</span> →
+            <span>...</span>
+        </div>
+
+        <div id="app">
+            <svg
+                id="ring-svg"
+                viewBox="-450 -440 900 880"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <defs>
+                    <marker
+                        id="arrow"
+                        markerWidth="8"
+                        markerHeight="6"
+                        refX="8"
+                        refY="3"
+                        orient="auto"
+                    >
+                        <path d="M0,0 L8,3 L0,6" fill="#6c7086" />
+                    </marker>
+                    <marker
+                        id="arrow-right"
+                        markerWidth="8"
+                        markerHeight="6"
+                        refX="8"
+                        refY="3"
+                        orient="auto"
+                    >
+                        <path d="M0,0 L8,3 L0,6" fill="#fab387" />
+                    </marker>
+                    <marker
+                        id="arrow-left"
+                        markerWidth="8"
+                        markerHeight="6"
+                        refX="8"
+                        refY="3"
+                        orient="auto"
+                    >
+                        <path d="M0,0 L8,3 L0,6" fill="#89b4fa" />
+                    </marker>
+                    <filter id="glow">
+                        <feGaussianBlur stdDeviation="2.5" result="blur" />
+                        <feMerge>
+                            <feMergeNode in="blur" />
+                            <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                    </filter>
+                </defs>
+                <g id="center-group"></g>
+                <g id="connectors-group"></g>
+                <g id="nodes-group"></g>
+            </svg>
+        </div>
+
+        <script>
+            // ============================================================
+            // Content Data
+            // ============================================================
+
+            const CENTER = {
+                title: "RD-Agent  ×  Qlib  系统架构",
+                left: {
+                    icon: "🤖",
+                    label: "RD-Agent",
+                    sub: "AI 因子工厂",
+                    items: [
+                        {
+                            label: "假设生成",
+                            detail: "LLM 根据历史反馈提出新假说",
+                        },
+                        {
+                            label: "方案设计",
+                            detail: "生成因子名称、公式、变量规格",
+                        },
+                        {
+                            label: "代码生成",
+                            detail: "CoSTEER 多轮自改进，生成代码",
+                        },
+                        {
+                            label: "反馈学习",
+                            detail: "分析回测结果，决定替换 SOTA",
+                        },
+                    ],
+                    color: "#fab387",
+                },
+                right: {
+                    icon: "📊",
+                    label: "Qlib",
+                    sub: "量化回测引擎",
+                    items: [
+                        {
+                            label: "数据处理",
+                            detail: "加载行情数据，计算 Alpha158",
+                        },
+                        {
+                            label: "模型训练",
+                            detail: "LightGBM 按时间序列分割训练",
+                        },
+                        { label: "回测执行", detail: "Top-K 选股 + 模拟撮合" },
+                        {
+                            label: "指标分析",
+                            detail: "输出 IC / ICIR / Sharpe / MaxDD",
+                        },
+                    ],
+                    color: "#89b4fa",
+                },
+                dataFlow: { right: "code →", left: "← metric" },
+                footer: "🔄 闭环驱动：回测指标反馈给 RD-Agent，驱动下一轮假设改进",
+            };
+
+            const STAGES = [
+                {
+                    id: "hypothesis",
+                    icon: "🤔",
+                    label: "提出假设",
+                    color: "#a6e3a1",
+                    code: "rd_loop.py:_propose",
+                    substeps: [
+                        {
+                            title: "组装历史上下文",
+                            detail: {
+                                process:
+                                    "遍历 trace.hist，取出每一轮的 (experiment, feedback) 元组。对每条记录提取：假设文本、因子任务摘要、回测关键指标（IC/年化收益/最大回撤）、反馈意见。通过 prompts.yaml 的 hypothesis_and_feedback 模板拼接为格式化文本，作为 LLM 的历史经验输入。首轮没有历史，直接告知 LLM 'No previous hypothesis available'。",
+                                examples: [
+                                    {
+                                        title: "trace.hist 结构",
+                                        code: "// trace.hist 是一个列表，每个元素是 (experiment, feedback) 元组\n[\n  (QlibFactorExperiment_0, HypothesisFeedback_0),\n  (QlibFactorExperiment_1, HypothesisFeedback_1),\n  ...\n]\n\n// 每个 experiment 包含：\n//   .hypothesis — Hypothesis 对象\n//   .sub_tasks — FactorTask 列表\n//   .result — DataFrame (IC, Sharpe, MaxDD 等)\n//\n// 每个 feedback 包含：\n//   .observations — 对结果的观察\n//   .hypothesis_evaluation — 假设是否成立\n//   .decision — 是否替换 SOTA",
+                                    },
+                                    {
+                                        title: "拼接后的上下文示例",
+                                        code: "=========================================================\n# Trial 1:\n## Hypothesis\n动量因子能捕获短期趋势，预期 IC > 0.03。\n\n## Backtest Result:\nIC: 0.024 | annualized_return: 0.085 | max_drawdown: -0.15\n\nObservation: IC偏低，但年化收益仍为正。\nHypothesis Evaluation: 因子方向正确，但信号强度不足。\nDecision: False\n=========================================================\n# Trial 2:\n...",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "RAG 策略注入",
+                            detail: {
+                                process:
+                                    "根据当前轮次动态注入探索策略。前 15 轮提示 LLM 优先尝试简单、易实现的因子（如价格动量、成交量比率），从多个角度快速覆盖。超过 15 轮后，提示 LLM 尝试复杂因子（如基于机器学习的因子、多维交叉因子）。这个阈值在 factor_proposal.py 的 prepare_context() 中硬编码。",
+                                examples: [
+                                    {
+                                        title: "前15轮 RAG 策略",
+                                        code: 'RAG: "Try the easiest and fastest factors to experiment\n      with from various perspectives first."',
+                                    },
+                                    {
+                                        title: "15轮后 RAG 策略",
+                                        code: 'RAG: "Now, you need to try factors that can achieve\n      high IC (e.g., machine learning-based factors)."',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "LLM 生成假设",
+                            detail: {
+                                process:
+                                    "将组装好的上下文 + RAG 策略 + 输出格式说明发给 LLM。使用的 prompt 模板在 prompts.yaml 的 factor_hypothesis_output_format 和 factor_hypothesis_specification 中定义。规范要求：每轮生成 1-5 个因子的假设、假设要可测试且精确、先简单后复杂、如果连续多轮失败则切换方向。LLM 返回 JSON: {hypothesis, reason}。",
+                                examples: [
+                                    {
+                                        title: "系统 Prompt (简化)",
+                                        code: '你是一家顶级对冲基金的首席量化研究员。\n基于历史实验结果，提出新的因子假设。\n\n要求：\n1. 每轮生成 1-5 个因子\n2. 先尝试简单有效的因子\n3. 假设要精确、可测试\n4. 用两到三句话描述\n\n输出 JSON 格式：\n{"hypothesis": "...", "reason": "..."}',
+                                    },
+                                    {
+                                        title: "LLM 返回示例",
+                                        code: '{\n  "hypothesis": "基于过去10日成交量加权平均价与收盘价的偏离度\n              构建反转因子。当偏离度超过2个标准差时，\n              预期未来5日收益会发生均值回归。",\n  "reason": "量价偏离通常在短期内会修正，\n           此前动量因子已取得正向IC，\n           但波动较大，反转因子可作为互补。"\n}',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "解析输出 → Hypothesis 对象",
+                            detail: {
+                                process:
+                                    "调用 QlibFactorHypothesisGen.convert_response() 解析 LLM 返回的 JSON 字符串。用 json.loads() 反序列化，提取 hypothesis 和 reason 字段，构造 QlibFactorHypothesis 对象。如果 JSON 解析失败，整个本轮实验会跳过并报错。",
+                                examples: [
+                                    {
+                                        title: "转换代码",
+                                        code: 'def convert_response(self, response: str) -> Hypothesis:\n    response_dict = json.loads(response)\n    return QlibFactorHypothesis(\n        hypothesis=response_dict["hypothesis"],\n        reason=response_dict["reason"],\n    )',
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "exp_gen",
+                    icon: "📝",
+                    label: "实验方案",
+                    color: "#f9e2af",
+                    code: "factor_proposal.py",
+                    substeps: [
+                        {
+                            title: "组装 LLM 上下文",
+                            detail: {
+                                process:
+                                    "QlibFactorHypothesis2Experiment.prepare_context() 将以下内容打包：① 当前 hypothesis 文本 ② scenario 描述（数据格式、回测配置、接口说明） ③ 历史 trace 中只包含因子实验的记录（过滤掉模型实验） ④ 输出格式规范。对于首轮，不包含历史信息。",
+                                examples: [
+                                    {
+                                        title: "上下文字典结构",
+                                        code: '{\n  "target_hypothesis": "假设文本...",\n  "scenario": "数据格式: daily_pv.h5...\\n\n              接口: calculate_xxx()...\\n\n              回测: train 2020-2021, test 2022...",\n  "hypothesis_and_feedback": "# Trial 1: ...",\n  "experiment_output_format": "JSON schema...",\n  "target_list": [],\n  "RAG": null\n}',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "LLM 生成因子规格",
+                            detail: {
+                                process:
+                                    "LLM 根据 hypothesis 将抽象想法转化为具体的因子定义。每个因子必须包含：① name（因子名称）② description（类型+描述，如'[Momentum Factor] 5日价格动量'）③ formulation（LaTeX 数学公式）④ variables（公式中每个变量的含义）。输出格式在 prompts.yaml 的 factor_experiment_output_format 中定义为严格的 JSON schema。",
+                                examples: [
+                                    {
+                                        title: "LLM 输出的因子规格",
+                                        code: '{\n  "Momentum_5d": {\n    "description": "[Momentum Factor] 5-day simple\n      return based on closing price.",\n    "formulation": "M_{5d,t} = \\\\frac{C_t}{C_{t-5}} - 1",\n    "variables": {\n      "C_t": "daily closing price ($close)",\n      "window": "5 trading days"\n    }\n  },\n  "Volume_Surge_Ratio_10d": {\n    "description": "[Volume Factor] Volume surge\n      relative to 10-day average.",\n    "formulation": "VSR_t = \\\\frac{V_t}{SMA(V,10)}",\n    "variables": {\n      "V_t": "daily volume ($volume)",\n      "SMA(V,10)": "simple moving average of volume"\n    }\n  }\n}',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "去重检查",
+                            detail: {
+                                process:
+                                    "遍历 based_experiments（历史所有实验），提取其中所有已实现过的因子名称。新生成的因子名如果在历史中出现过，直接跳过不重复生成。注意：这里只按名字去重，不做数值相关度去重（数值去重发生在因子运行阶段）。如果所有新因子都被去重掉，本次实验只有 SOTA 因子参与回测。",
+                                examples: [
+                                    {
+                                        title: "去重逻辑",
+                                        code: "unique_tasks = []\nfor task in tasks:\n    duplicate = False\n    for based_exp in exp.based_experiments:\n        for sub_task in based_exp.sub_tasks:\n            if task.factor_name == sub_task.factor_name:\n                duplicate = True\n                break\n        if duplicate: break\n    if not duplicate:\n        unique_tasks.append(task)\nexp.tasks = unique_tasks",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "输出 FactorTask 列表",
+                            detail: {
+                                process:
+                                    "QlibFactorHypothesis2Experiment.convert_response() 返回 QlibFactorExperiment 对象，其中包含去重后的 FactorTask 列表。每个 FactorTask 携带 factor_name、factor_description、factor_formulation、variables 四个字段，供后续代码生成阶段使用。",
+                                examples: [
+                                    {
+                                        title: "FactorTask 对象",
+                                        code: 'FactorTask(\n    factor_name="Momentum_5d",\n    factor_description="[Momentum Factor] 5-day simple\n      return based on closing price.",\n    factor_formulation="M_{5d,t} = C_t / C_{t-5} - 1",\n    variables={"C_t": "$close", "window": "5 days"}\n)',
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "coding",
+                    icon: "💻",
+                    label: "代码生成",
+                    color: "#fab387",
+                    code: "FactorCoSTEER",
+                    substeps: [
+                        {
+                            title: "解析因子规格 → Prompt 参数",
+                            detail: {
+                                process:
+                                    "将 FactorTask 的四个字段（name, description, formulation, variables）与 factor_template/ 目录中的模板文件合并。模板提供：① 代码骨架（import 语句、main 函数结构）② 数据格式说明（daily_pv.h5 的列名、索引结构）③ 接口规范（函数命名为 calculate_{name}、输出 result.h5）。合并后的上下文发给 LLM 生成初始代码。",
+                                examples: [
+                                    {
+                                        title: "模板中的关键接口说明",
+                                        code: "// 来自 prompts.yaml: qlib_factor_interface\n你的代码需要:\n1. 定义一个 main 函数: calculate_{factor_name}\n2. 在 if __name__ == '__main__' 中调用\n3. 从 daily_pv.h5 读取数据\n4. 计算因子值\n5. 保存到 result.h5 (MultiIndex: datetime, instrument)\n\nCRITICAL: 列名必须用 '$' 前缀 ($close, $open, ...)\n         不能用 'close' 或 'Close'",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "LLM 生成 factor.py",
+                            detail: {
+                                process:
+                                    "LLM 在模板约束下生成完整的 Python 代码。关键要求：① 只使用标准库 + pandas + numpy ② 数据从 daily_pv.h5 读取 ③ 列名带 $ 前缀 ④ 结果写入 result.h5 ⑤ 索引为 (datetime, instrument) MultiIndex ⑥ groupby 操作按 instrument 分组 ⑦ 正确处理滚动窗口（min_periods 参数）。生成的代码不能包含 try-except 块（让外层捕获异常并反馈）。",
+                                examples: [
+                                    {
+                                        title: "生成的 factor.py 示例",
+                                        code: "import pandas as pd\nimport numpy as np\n\ndef calculate_Momentum_5d():\n    df = pd.read_hdf('daily_pv.h5', key='data')\n    df = df.sort_index()\n    # 按股票分组计算5日动量\n    df['Momentum_5d'] = df.groupby(\n        'instrument'\n    )['$close'].transform(\n        lambda x: x / x.shift(5) - 1\n    )\n    result = df[['Momentum_5d']]\n    result.to_hdf('result.h5', key='data', mode='w')\n\nif __name__ == '__main__':\n    calculate_Momentum_5d()",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "CoSTEER 多轮自改进",
+                            detail: {
+                                process:
+                                    "CoSTEER (Coding Self-Training with Execution & Evaluation for Refinement) 是因子代码生成的核心质量保证机制。流程：① 执行生成的 factor.py ② 捕获 stdout/stderr/异常 ③ 如果成功，检查 result.h5 格式是否正确（索引、列名、数据类型）④ 如果失败，将错误信息作为反馈发给 LLM ⑤ LLM 根据错误信息修改代码 ⑥ 重新执行 ⑦ 最多重复 N 轮（由配置决定）⑧ 全部失败则标记该因子为未实现。",
+                                examples: [
+                                    {
+                                        title: "CoSTEER 循环示意",
+                                        code: "Round 1: 生成代码 → 执行 → KeyError: 'close'\n  → 反馈: \"列名应该是 $close 不是 close\"\n\nRound 2: 修改代码 → 执行 → TypeError: groupby key\n  → 反馈: \"索引需要 reset_index 后再 groupby\"\n\nRound 3: 修改代码 → 执行 → 成功 ✓\n  → 检查 result.h5: MultiIndex(datetime,instrument),\n     column=['Momentum_5d'], dtype=float64 ✓\n  → 保存到 workspace",
+                                    },
+                                    {
+                                        title: "常见错误与修复",
+                                        code: "| 错误                  | LLM修复方向              |\n|-----------------------|--------------------------|\n| KeyError: 'close'     | 改为 '$close'            |\n| 索引格式不对          | 加 sort_index()          |\n| groupby 报错          | reset_index 后再操作     |\n| result.h5 列名错误    | 确保单列，列名=因子名    |\n| min_periods 缺失      | 加 min_periods=window    |",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "保存到 workspace",
+                            detail: {
+                                process:
+                                    "通过 CoSTEER 验证的 factor.py 存入 workspace.file_dict['factor.py']。每个因子的 workspace 是独立的，对应 exp.sub_workspace_list 中的一个元素。后续 runner 阶段通过遍历 sub_workspace_list 获取所有因子代码并执行。",
+                                examples: [
+                                    {
+                                        title: "workspace 结构",
+                                        code: 'exp.sub_workspace_list = [\n    FactorFBWorkspace(\n        target_task=FactorTask("Momentum_5d", ...),\n        file_dict={"factor.py": "import pandas..."}\n    ),\n    FactorFBWorkspace(\n        target_task=FactorTask("Volume_Surge_Ratio_10d", ...),\n        file_dict={"factor.py": "import pandas..."}\n    ),\n    ...\n]',
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "running",
+                    icon: "▶️",
+                    label: "因子运行",
+                    color: "#cba6f7",
+                    code: "factor_runner.py",
+                    substeps: [
+                        {
+                            title: "多进程执行 factor.py",
+                            detail: {
+                                process:
+                                    "将所有 factor.py 文件和 daily_pv.h5 数据放入独立的工作目录。使用 multiprocessing_wrapper 并行执行（并行数由 multi_proc_n 配置控制）。每个因子在独立的工作目录中运行：读取 daily_pv.h5 → 计算因子值 → 写入 result.h5。如果某个因子执行失败（超时或异常），不影响其他因子的执行，失败信息记录到 error_message 中。",
+                                examples: [
+                                    {
+                                        title: "执行流程",
+                                        code: '// 1. 用 D.features() 导出 OHLCV 数据\nh5_data = D.features(instruments,\n    ["$open","$close","$high","$low","$volume","$factor"],\n    freq="day", start="2008-01-01", end=end_date)\nh5_data = h5_data.swaplevel().sort_index()\n\n// 2. 保存为 daily_pv.h5\nh5_data.to_hdf(tmpdir / "daily_pv.h5", key="data")\n\n// 3. 每个因子创建独立子目录，symlink daily_pv.h5\nfor factor in factors:\n    work_dir = tmpdir / factor_name\n    os.symlink(h5_path, work_dir / "daily_pv.h5")\n\n// 4. 并行执行\nsubprocess.run([python, factor.py], cwd=work_dir, timeout=300)',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "收集并归一化索引",
+                            detail: {
+                                process:
+                                    "遍历所有因子执行结果，读取各自的 result.h5。通过 _normalize_factor_index() 函数统一索引格式：确保每个 result 的索引为标准的 (datetime, instrument) 两层 MultiIndex。过滤掉索引格式不合法、含分钟级数据、datetime 不存在的异常结果。所有合法的因子 DataFrame 加入 factor_dfs 列表，后续用 pd.concat 合并。",
+                                examples: [
+                                    {
+                                        title: "索引归一化逻辑",
+                                        code: "def _normalize_factor_index(df):\n    # 必须同时有 datetime 和 instrument 索引\n    if 'datetime' not in df.index.names:\n        return None\n    if 'instrument' not in df.index.names:\n        return None\n    # 提取索引值\n    dt = _resolve_index_level_values(df, 'datetime')\n    inst = _resolve_index_level_values(df, 'instrument')\n    # 重建标准 MultiIndex\n    df.index = pd.MultiIndex.from_arrays(\n        [dt, inst], names=['datetime', 'instrument']\n    )\n    return df",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "IC 相关度去重",
+                            detail: {
+                                process:
+                                    "将 SOTA 因子（历史成功的因子）和新因子拼接为一个 DataFrame。逐对计算每个新因子与每个 SOTA 因子的 IC（Information Coefficient / 相关系数）。对于每个新因子，取它与所有 SOTA 因子的最大 IC。如果 max(IC) ≥ 0.99，说明该新因子与某个已有因子高度线性相关，没有提供额外信息，直接剔除。这个去重发生在因子运行阶段（区别于实验方案阶段的名字去重）。",
+                                examples: [
+                                    {
+                                        title: "IC去重计算",
+                                        code: "concat_feature = pd.concat([SOTA, new], axis=1)\n\n# 对每个交易日，计算新因子×SOTA因子的相关系数矩阵\nIC_max = concat_feature.groupby('datetime')\\\n    .apply(lambda x: 各列之间的相关系数)\\\n    .mean()  # 按时间取平均\n\n# 对于新因子j，取它与所有SOTA因子的最大绝对IC\nfor j in range(len(new_factors)):\n    max_ic = max(abs(IC_max[i][j]) for i in SOTA_cols)\n    if max_ic >= 0.99:\n        drop new_factor_j  // 几乎相同，剔除",
+                                    },
+                                    {
+                                        title: "去重示例",
+                                        code: "SOTA因子库: [Momentum_5d, Volume_Surge_10d]\n新因子: [Price_Momentum_Short, VWAP_Deviation]\n\nIC(Price_Momentum_Short, Momentum_5d) = 0.995\n  → 几乎完全相同 → 剔除 Price_Momentum_Short\n\nIC(VWAP_Deviation, *) = [0.12, 0.08]\n  → max=0.12 < 0.99 → 保留 VWAP_Deviation\n\n最终: [Momentum_5d, Volume_Surge_10d, VWAP_Deviation]",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "合并保存",
+                            detail: {
+                                process:
+                                    "将 SOTA 因子和去重后的新因子用 pd.concat 沿列方向合并。排序索引（sort_index），去重列名（如果有重复列保留最后一个）。列名包装为 MultiIndex ('feature', factor_name) 格式，然后保存为 combined_factors_df.parquet（Parquet 格式比 pickle 兼容性更好）。同时调用 _save_factor_codes() 将所有 factor.py 文件和 factor_info.json 保存到 backtest_results/round_n/factors/ 目录。",
+                                examples: [
+                                    {
+                                        title: "最终输出",
+                                        code: '// combined_factors_df.parquet 结构\n                     feature\n                     Momentum_5d  Volume_Surge_10d  VWAP_Deviation\ndatetime   instrument\n2020-01-02 SH600000   0.0231        1.15              -0.0042\n           SZ000001  -0.0156        0.87               0.0113\n...\n\n// factor_info.json\n[\n  {"name":"Momentum_5d","description":"...",\n   "formulation":"...","variables":{...},\n   "file":"factors/Momentum_5d.py"},\n  ...\n]\n\n// factors/ 目录\nfactors/\n  Momentum_5d.py\n  Volume_Surge_Ratio_10d.py\n  VWAP_Deviation.py\n  factor_info.json',
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "backtest",
+                    icon: "📊",
+                    label: "回测评估",
+                    color: "#89dceb",
+                    code: "workspace.py:execute()",
+                    substeps: [
+                        {
+                            title: "加载特征数据",
+                            detail: {
+                                process:
+                                    "Docker 容器内启动 Qlib。通过 Qlib 表达式引擎 D.features() 并行计算 20 个基础 Alpha158 特征（如 CORD10、RESI5、RSQR20 等，均为预定义的数学表达式）。同时从 combined_factors_df.parquet 加载自定义因子。两组特征按列合并，构造完整的特征矩阵。如果存在 SOTA PyTorch 模型，还会加载 model.py。",
+                                examples: [
+                                    {
+                                        title: "20个 Alpha158 基础特征",
+                                        code: '// qlib表达式 → 自动并行计算\nBASE_ALPHA158 = {\n  "CORD10": "Corr($close/Ref($close,1),\n              Log($volume/Ref($volume,1)+1), 10)",\n  "RESI5": "Resi($close, 5)/$close",\n  "RSQR20": "Rsquare($close, 20)",\n  "STD5": "Std($close, 5)/$close",\n  "WVMA60": "Std(Abs($close/Ref($close,1)-1)*$volume,60)\n              /(Mean(...)+1e-12)",\n  ... // 共20个\n}\n\n// 执行\nfeatures = D.features(instruments, expressions,\n                       start_time, end_time)',
+                                    },
+                                    {
+                                        title: "特征矩阵合并",
+                                        code: "// Alpha158 特征 (20列)\nbase_df  = D.features(instruments, alpha158_exprs, ...)\n\n// 自定义因子 (来自 combined_factors_df.parquet)\ncustom_df = pd.read_parquet('combined_factors_df.parquet')\n\n// 合并: 按 (datetime, instrument) 对齐\nfull_features = pd.concat([base_df, custom_df], axis=1)",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "DataHandler 处理",
+                            detail: {
+                                process:
+                                    "DataHandlerLP 是 Qlib 的标准数据处理流水线。它执行以下操作：① 将所有特征列按字母序排列（这是 critical 的行为——训练和预测必须一致）② 计算标签（Label）：未来第2个交易日的收益率，即 Ref($close, -2) / $close - 1 ③ 去除包含 NaN 的行（dropna）④ 按时间划分 train/valid/test 三个数据集（如 train: 2020-2021, valid: 2022 Q1, test: 2022 Q2-2023）⑤ 标准化/归一化处理（可选）。",
+                                examples: [
+                                    {
+                                        title: "DataHandlerLP 配置",
+                                        code: '// conf_combined_factors.yaml\nhandler:\n    class: DataHandlerLP\n    module_path: qlib.contrib.data.handler\n    kwargs:\n        start_time: "2020-01-01"\n        end_time: "2023-12-31"\n        fit_start_time: "2020-01-01"\n        fit_end_time: "2022-06-30"\n        instruments: "csi300"\n        # Alpha158 + 自定义因子的表达式列表\n        # DataHandlerLP 自动按字母序排列',
+                                    },
+                                    {
+                                        title: "字母序排列的重要性",
+                                        code: "// 训练时特征顺序（字母序）:\n// CORD10, CORD5, CORD60, CORR10, CORR20, CORR5,\n// CORR60, KLEN, KLOW, Momentum_5d, RESI10, RESI5,\n// ROC60, RSQR10, RSQR20, RSQR5, RSQR60, STD5,\n// Volume_Surge_Ratio_10d, VSTD5, WVMA5, WVMA60\n\n// LightGBM booster 按此顺序记住了 feature_id\n// 预测时如果顺序不同 → 结果完全错误",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "LightGBM 训练",
+                            detail: {
+                                process:
+                                    "使用 LightGBM 的回归模式训练模型。输入是特征矩阵 X，目标是未来收益 Label y。默认使用 conf_combined_factors.yaml 中的参数配置（如 num_leaves=32, learning_rate=0.05, n_estimators=500, early_stopping=50）。训练时监控 valid 集的损失，提前停止防止过拟合。如果存在此前的 SOTA PyTorch 模型，则使用 conf_combined_factors_sota_model.yaml 配置来训练 PyTorch 模型而非 LightGBM。",
+                                examples: [
+                                    {
+                                        title: "LightGBM 参数",
+                                        code: "// conf_combined_factors.yaml 中的模型配置\nmodel:\n    class: LGBModel\n    module_path: qlib.contrib.model.lgb\n    kwargs:\n        loss: mse\n        colsample_bytree: 0.8\n        learning_rate: 0.05\n        num_leaves: 32\n        n_estimators: 500\n        early_stopping_rounds: 50\n        seed: 42",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "生成预测信号",
+                            detail: {
+                                process:
+                                    "训练好的 LightGBM booster（或 PyTorch 模型）对测试集每个交易日、每只股票产生一个预测 score。score 是模型对未来收益的点估计，值越大表示预期收益越高。每个交易日对所有股票的 score 进行排名，生成 cross-sectional 排序信号。",
+                                examples: [
+                                    {
+                                        title: "预测输出",
+                                        code: "// 测试集预测结果\n                     score\ndatetime   instrument\n2023-01-03 SH600000   0.0234\n           SZ000001  -0.0056\n           SH600519   0.0412\n           SZ300750   0.0189\n           ...\n// score > 0 → 预期未来上涨\n// score < 0 → 预期未来下跌\n// 每日排名: 选 score 最高的 top-K 只",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "策略执行",
+                            detail: {
+                                process:
+                                    "Top-K 多头策略：每个交易日，选取预测 score 最高的 K 只股票（默认 K=50 或总股票数的 20%），等权配置资金。可以设置是否允许做空、是否考虑交易成本、单只股票最大权重等约束。Qlib 的策略框架通过 BaseStrategy.generate_trade_decision() 生成交易决策，返回 Order 列表。",
+                                examples: [
+                                    {
+                                        title: "策略配置",
+                                        code: "// Top-K 策略参数\nstrategy:\n    class: TopkDropoutStrategy\n    module_path: qlib.contrib.strategy\n    kwargs:\n        topk: 50          # 选50只\n        n_drop: 5         # 每天最多换5只\n        risk_degree: 0.95 # 风险厌恶系数",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "模拟交易 & 报告",
+                            detail: {
+                                process:
+                                    "Qlib 的 Exchange 组件模拟真实市场环境：按当日成交价撮合、扣除交易成本（佣金+滑点）、处理涨跌停限制。Account 和 Position 追踪资金和持仓变化。每笔交易的 PnL 累积形成组合收益曲线。最终自动计算 20+ 回测指标：IC（当日 score 与未来收益的相关系数）、ICIR（IC均值/IC标准差）、Rank IC（秩相关系数）、年化收益、夏普比率、信息比率、最大回撤、换手率等，写入 qlib_res.csv。",
+                                examples: [
+                                    {
+                                        title: "qlib_res.csv 关键指标",
+                                        code: "IC                           0.0461\nICIR                         0.6321\nRank IC                      0.0192\nRank ICIR                    0.2295\n1day.excess_return_with_cost.annualized_return   0.1331\n1day.excess_return_with_cost.information_ratio   0.6894\n1day.excess_return_with_cost.max_drawdown       -0.2432\n1day.excess_return_without_cost.annualized_return 0.2263\n1day.excess_return_without_cost.max_drawdown     -0.2407\n1day.excess_return_without_cost.information_ratio 1.1723",
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "feedback",
+                    icon: "💡",
+                    label: "反馈学习",
+                    color: "#f38ba8",
+                    code: "feedback.py",
+                    substeps: [
+                        {
+                            title: "提取关键指标",
+                            detail: {
+                                process:
+                                    "从 qlib_res.csv 中提取三个核心指标用于反馈判断：IC（因子预测能力）、1day.excess_return_with_cost.annualized_return（含成本的年化超额收益）、1day.excess_return_with_cost.max_drawdown（含成本的最大回撤）。这三个指标在 feedback.py 的 IMPORTANT_METRICS 列表中定义。同时提取 SOTA（当前最优）的对应指标用于对比。",
+                                examples: [
+                                    {
+                                        title: "指标提取代码",
+                                        code: 'IMPORTANT_METRICS = [\n    "IC",\n    "1day.excess_return_with_cost.annualized_return",\n    "1day.excess_return_with_cost.max_drawdown",\n]\n\ncurrent_values = result.loc[IMPORTANT_METRICS]\nsota_values = sota_result.loc[IMPORTANT_METRICS]',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "对比 SOTA 结果",
+                            detail: {
+                                process:
+                                    "将当前实验结果与 SOTA 结果并排对比。对每个指标计算差值，格式化为 LLM 可读的文本（如 'IC of Current Result is 0.046, of SOTA Result is 0.041'）。这个对比文本是 LLM 反馈生成的核心输入，帮助 LLM 判断新因子是否带来了实质性改进。",
+                                examples: [
+                                    {
+                                        title: "对比输出",
+                                        code: "IC of Current Result is 0.046118, of SOTA Result is 0.041234;\nannualized_return of Current Result is 0.133067, of SOTA Result is 0.125400;\nmax_drawdown of Current Result is -0.243158, of SOTA Result is -0.251000",
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "LLM 分析反馈",
+                            detail: {
+                                process:
+                                    "将场景描述 + 假设文本 + 因子详情 + 指标对比 打包发给 LLM。LLM 扮演专业量化分析助理的角色，需要输出：① Observations（对结果的客观观察）② Feedback for Hypothesis（假设是否得到验证）③ New Hypothesis（新的改进方向）④ Reasoning（推理过程）⑤ Replace Best Result（是否替换 SOTA，yes/no）。Response 要求 JSON 格式。",
+                                examples: [
+                                    {
+                                        title: "反馈 Prompt（简化）",
+                                        code: 'System: 你是专业量化分析助理。\n基于回测结果，判断假设是否成立，提出改进方向。\n\n判断标准:\n1. 年化收益有提升 → 建议替换 SOTA\n2. 其他指标小幅波动可接受\n3. 显著差于 SOTA → 建议换方向\n\nUser: 假设: {hypothesis}\n因子: {factor_details}\n结果对比: {combined_result}\n\n请输出 JSON:\n{\n  "Observations": "...",\n  "Feedback for Hypothesis": "...",\n  "New Hypothesis": "...",\n  "Reasoning": "...",\n  "Replace Best Result": "yes/no"\n}',
+                                    },
+                                    {
+                                        title: "LLM 返回示例",
+                                        code: '{\n  "Observations": "IC 从 0.041 提升到 0.046，\n    年化收益从 12.5% 提升到 13.3%。\n    但最大回撤略有扩大。",\n  "Feedback for Hypothesis": "假设基本成立，\n    成交量加权反转因子确实提供了增量信息。",\n  "New Hypothesis": "在反转因子基础上，\n    加入波动率过滤条件，\n    有望在控制回撤的同时保持收益。",\n  "Reasoning": "收益提升但回撤扩大，\n    说明因子在高波动时期表现较差，\n    需要波动率过滤来改善风险调整后收益。",\n  "Replace Best Result": "yes"\n}',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "SOTA 替换判断",
+                            detail: {
+                                process:
+                                    "LLM 返回的 Replace Best Result 字段决定了当前结果是否成为新的 SOTA（State of the Art）。判断核心标准：年化收益（annualized_return）有提升即建议替换。微小波动（如回撤略有扩大但收益提升显著）可以接受。如果确定为 SOTA，当前实验的所有因子进入 SOTA 因子库，后续轮次自动包含。",
+                                examples: [
+                                    {
+                                        title: "替换决策流程",
+                                        code: 'if response["Replace Best Result"] == "yes":\n    # 当前结果 → 新的 SOTA\n    # 当前因子 → 进入 SOTA 因子库\n    # 下一轮 baseline = 当前实验\n    sota = current_experiment\nelse:\n    # 保持原有 SOTA\n    # 当前因子不进入因子库\n    # 下一轮 baseline = 原来的 SOTA',
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            title: "写入 trace.hist",
+                            detail: {
+                                process:
+                                    "rd_loop.py 的 record() 方法将 (experiment, feedback) 元组追加到 trace.hist 列表。同时调用 trace.sync_dag_parent_and_hist() 更新 DAG（有向无环图）结构，记录实验之间的父子关系（如哪个实验是基于哪个 SOTA 做的改进）。trace 对象在下一轮 _propose() 时作为历史上下文传入 LLM，形成闭环的持续学习。",
+                                examples: [
+                                    {
+                                        title: "trace 循环",
+                                        code: "// Round 1\n_propose() → 读取 trace.hist = []  (空)\n  → 生成初始假设\n  → 实验 → 反馈\n  → record() → trace.hist = [(exp1, fb1)]\n\n// Round 2\n_propose() → 读取 trace.hist = [(exp1, fb1)]\n  → 基于 Round1 的经验生成新假设\n  → 实验 → 反馈\n  → record() → trace.hist = [(exp1, fb1), (exp2, fb2)]\n\n// Round N\n_propose() → 读取前 N-1 轮的所有经验\n  → 综合历史教训，生成最优假设",
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            ];
+
+            // ============================================================
+            // Layout Constants
+            // ============================================================
+
+            const RING_R = 340,
+                NODE_R = 32;
+            const CX = 0,
+                CY = 0;
+            const SVG_NS = "http://www.w3.org/2000/svg";
+
+            let currentStage = null;
+            let expandedIdx = null;
+            let expandedExampleCodes = new Set();
+            const MAX_CARD_H = 240;
+
+            // ============================================================
+            // Helpers
+            // ============================================================
+
+            function $el(tag, attrs) {
+                const el = document.createElementNS(SVG_NS, tag);
+                for (const [k, v] of Object.entries(attrs)) {
+                    if (k === "textContent") el.textContent = v;
+                    else if (k === "innerHTML") el.innerHTML = v;
+                    else if (k.startsWith("on")) {
+                        const ev = k.slice(2).toLowerCase();
+                        el.addEventListener(ev, v);
+                    } else {
+                        el.setAttribute(k, v);
+                    }
+                }
+                return el;
+            }
+
+            function wrapText(text, maxLen) {
+                const lines = [];
+                let cur = "";
+                for (const w of text.split(" ")) {
+                    if ((cur + " " + w).length > maxLen && cur) {
+                        lines.push(cur.trim());
+                        cur = w;
+                    } else {
+                        cur += " " + w;
+                    }
+                }
+                if (cur.trim()) lines.push(cur.trim());
+                return lines;
+            }
+
+            // ============================================================
+            // Detail Card Helpers
+            // ============================================================
+
+            function escHtml(s) {
+                return s
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;");
+            }
+
+            function estimateLines(text) {
+                // Estimate wrapped lines at 13px font (~32 CJK chars/line in card)
+                return Math.max(1, Math.ceil(text.length / 32));
+            }
+
+            function getCardHeight(stage, substepIdx) {
+                const d = stage.substeps[substepIdx].detail;
+                const processH = estimateLines(d.process) * 16 + 16;
+                let examplesH = 24;
+                d.examples.forEach((ex, i) => {
+                    const key = `${stage.id}-${substepIdx}-${i}`;
+                    examplesH += 26;
+                    if (expandedExampleCodes.has(key)) {
+                        examplesH += ex.code.split("\n").length * 14 + 24;
+                    }
+                });
+                return Math.min(44 + processH + examplesH, MAX_CARD_H);
+            }
+
+            window._toggleEx = function (key) {
+                if (expandedExampleCodes.has(key)) {
+                    expandedExampleCodes.delete(key);
+                } else {
+                    expandedExampleCodes.add(key);
+                }
+                if (currentStage) renderCenterSubSteps(currentStage);
+            };
+
+            // ============================================================
+            // Ring Rendering
+            // ============================================================
+
+            function renderRing(activeId) {
+                const nodesG = document.getElementById("nodes-group");
+                const connG = document.getElementById("connectors-group");
+                nodesG.innerHTML = "";
+                connG.innerHTML = "";
+
+                const n = STAGES.length;
+
+                STAGES.forEach((s, i) => {
+                    const angle = -Math.PI / 2 + (2 * Math.PI * i) / n;
+                    const x = CX + RING_R * Math.cos(angle);
+                    const y = CY + RING_R * Math.sin(angle);
+                    const isActive = activeId === s.id;
+                    const opacity = activeId && !isActive ? 0.3 : 1;
+
+                    // Connector arc to next node
+                    const nextI = (i + 1) % n;
+                    const nextAngle = -Math.PI / 2 + (2 * Math.PI * nextI) / n;
+                    const rConn = RING_R - NODE_R - 10;
+                    const ax = CX + rConn * Math.cos(angle);
+                    const ay = CY + rConn * Math.sin(angle);
+                    const bx = CX + rConn * Math.cos(nextAngle);
+                    const by = CY + rConn * Math.sin(nextAngle);
+                    const largeArc =
+                        (nextAngle - angle + 2 * Math.PI) % (2 * Math.PI) >
+                        Math.PI
+                            ? 1
+                            : 0;
+                    connG.appendChild(
+                        $el("path", {
+                            d: `M${ax},${ay} A${rConn},${rConn} 0 ${largeArc},1 ${bx},${by}`,
+                            fill: "none",
+                            stroke: "#6c7086",
+                            "stroke-width": "1.2",
+                            "marker-end": "url(#arrow)",
+                            opacity,
+                            class: "connector",
+                        }),
+                    );
+
+                    // Node group
+                    const g = $el("g", {
+                        transform: `translate(${x},${y})`,
+                        opacity,
+                        class: "node-group ring-node",
+                        onclick: (e) => {
+                            e.stopPropagation();
+                            showLevel2(s.id);
+                        },
+                    });
+
+                    if (isActive) {
+                        g.appendChild(
+                            $el("circle", {
+                                r: NODE_R + 8,
+                                fill: "none",
+                                stroke: s.color,
+                                "stroke-width": "3",
+                                opacity: "0.4",
+                                filter: "url(#glow)",
+                            }),
+                        );
+                    }
+
+                    g.appendChild(
+                        $el("circle", {
+                            r: NODE_R,
+                            fill: s.color,
+                            opacity: isActive ? "1" : "0.85",
+                        }),
+                    );
+                    g.appendChild(
+                        $el("text", {
+                            "text-anchor": "middle",
+                            dy: "0.35em",
+                            fill: "#1e1e2e",
+                            "font-size": "24",
+                            "font-family": "sans-serif",
+                            textContent: s.icon,
+                        }),
+                    );
+
+                    // Label
+                    g.appendChild(
+                        $el("text", {
+                            y: NODE_R + 25,
+                            "text-anchor": "middle",
+                            fill: isActive ? s.color : "#6c7086",
+                            "font-size": "16",
+                            class: "node-label",
+                            textContent: s.label,
+                        }),
+                    );
+
+                    nodesG.appendChild(g);
+                });
+            }
+
+            // ============================================================
+            // Center Area Rendering
+            // ============================================================
+
+            function bgRect(w, h, strokeColor, topY) {
+                const y = topY !== undefined ? topY : -h / 2;
+                return $el("rect", {
+                    x: -w / 2,
+                    y: y,
+                    width: w,
+                    height: h,
+                    rx: 14,
+                    fill: "#313244",
+                    stroke: strokeColor || "#89b4fa",
+                    "stroke-width": "1.5",
+                    "pointer-events": "none", // allow clicks to pass through to ring nodes behind
+                });
+            }
+
+            function renderCenterDefault() {
+                const g = document.getElementById("center-group");
+                g.innerHTML = "";
+                currentStage = null;
+                expandedIdx = null;
+
+                const W = 470,
+                    H = 275;
+                g.appendChild(bgRect(W, H, "#89b4fa"));
+
+                // Title
+                g.appendChild(
+                    $el("text", {
+                        x: 0,
+                        y: -108,
+                        "text-anchor": "middle",
+                        fill: "#89b4fa",
+                        "font-size": "20",
+                        "font-weight": "bold",
+                        textContent: CENTER.title,
+                    }),
+                );
+
+                // Divider line under title
+                g.appendChild(
+                    $el("line", {
+                        x1: -205,
+                        y1: -92,
+                        x2: 205,
+                        y2: -92,
+                        stroke: "#45475a",
+                        "stroke-width": "1",
+                    }),
+                );
+
+                // --- Columns ---
+                const colW = 180,
+                    gap = 70;
+                const leftX = -colW - gap / 2;
+                const rightX = gap / 2;
+                const colTop = -80;
+                const colH = 168;
+
+                renderArchColumn(g, leftX, colTop, colW, colH, CENTER.left);
+                renderArchColumn(g, rightX, colTop, colW, colH, CENTER.right);
+
+                // --- Center arrows ---
+                const arrowY = colTop + colH / 2;
+                // Top: code → (left to right)
+                g.appendChild(
+                    $el("text", {
+                        x: 0,
+                        y: arrowY - 14,
+                        "text-anchor": "middle",
+                        fill: "#fab387",
+                        "font-size": "11",
+                        "font-weight": "bold",
+                        textContent: "code",
+                    }),
+                );
+                g.appendChild(
+                    $el("line", {
+                        x1: -24,
+                        y1: arrowY - 6,
+                        x2: 24,
+                        y2: arrowY - 6,
+                        stroke: "#fab387",
+                        "stroke-width": "1.5",
+                        "marker-end": "url(#arrow-right)",
+                    }),
+                );
+                // Bottom: ← metric (right to left)
+                g.appendChild(
+                    $el("line", {
+                        x1: 24,
+                        y1: arrowY + 6,
+                        x2: -24,
+                        y2: arrowY + 6,
+                        stroke: "#89b4fa",
+                        "stroke-width": "1.5",
+                        "marker-end": "url(#arrow-left)",
+                    }),
+                );
+                g.appendChild(
+                    $el("text", {
+                        x: 0,
+                        y: arrowY + 22,
+                        "text-anchor": "middle",
+                        fill: "#89b4fa",
+                        "font-size": "11",
+                        "font-weight": "bold",
+                        textContent: "metric",
+                    }),
+                );
+
+                // --- Footer ---
+                g.appendChild(
+                    $el("text", {
+                        x: 0,
+                        y: colTop + colH + 22,
+                        "text-anchor": "middle",
+                        fill: "#6c7086",
+                        "font-size": "13",
+                        textContent: CENTER.footer,
+                    }),
+                );
+
+                // Click-catcher
+                g.appendChild(
+                    $el("rect", {
+                        x: -W / 2,
+                        y: -H / 2,
+                        width: W,
+                        height: H,
+                        rx: 14,
+                        fill: "transparent",
+                    }),
+                );
+            }
+
+            function renderArchColumn(g, x, y, w, h, col) {
+                g.appendChild(
+                    $el("rect", {
+                        x: x,
+                        y: y,
+                        width: w,
+                        height: h,
+                        rx: 8,
+                        fill: "#313244",
+                        stroke: col.color,
+                        "stroke-width": "1.2",
+                    }),
+                );
+
+                // Header row 1: icon + label
+                g.appendChild(
+                    $el("text", {
+                        x: x + 14,
+                        y: y + 22,
+                        "text-anchor": "start",
+                        fill: col.color,
+                        "font-size": "14",
+                        "font-weight": "bold",
+                        textContent: col.icon + " " + col.label,
+                    }),
+                );
+                // Header row 2: subtitle
+                g.appendChild(
+                    $el("text", {
+                        x: x + 14,
+                        y: y + 37,
+                        "text-anchor": "start",
+                        fill: "#6c7086",
+                        "font-size": "11",
+                        textContent: col.sub,
+                    }),
+                );
+
+                // Separator
+                g.appendChild(
+                    $el("line", {
+                        x1: x + 10,
+                        y1: y + 45,
+                        x2: x + w - 10,
+                        y2: y + 45,
+                        stroke: "#45475a",
+                        "stroke-width": "0.8",
+                    }),
+                );
+
+                // Items: 2 lines each (label bold, detail below)
+                col.items.forEach((item, i) => {
+                    const iy = y + 58 + i * 30;
+                    g.appendChild(
+                        $el("circle", {
+                            cx: x + 14,
+                            cy: iy - 1,
+                            r: 3,
+                            fill: col.color,
+                        }),
+                    );
+                    g.appendChild(
+                        $el("text", {
+                            x: x + 22,
+                            y: iy,
+                            "text-anchor": "start",
+                            fill: "#cdd6f4",
+                            "font-size": "13",
+                            "font-weight": "bold",
+                            textContent: item.label,
+                        }),
+                    );
+                    g.appendChild(
+                        $el("text", {
+                            x: x + 22,
+                            y: iy + 15,
+                            "text-anchor": "start",
+                            fill: "#6c7086",
+                            "font-size": "11",
+                            textContent: item.detail,
+                        }),
+                    );
+                });
+            }
+
+            function renderCenterSubSteps(stage) {
+                const g = document.getElementById("center-group");
+                g.innerHTML = "";
+
+                const W = 540;
+                const hasCard = expandedIdx !== null;
+                const subCount = stage.substeps.length;
+                const rowH = 42,
+                    startY = -82;
+                const cardH = hasCard ? getCardHeight(stage, expandedIdx) : 0;
+
+                // Pin bg top at fixed Y, grow downward only as card expands
+                const fixedTop = -160;
+                const bottomContentY = hasCard
+                    ? startY + subCount * rowH + 14 + cardH + 14 // card bottom + margin
+                    : startY + subCount * rowH + 30; // tip text below substeps
+                const H = bottomContentY - fixedTop;
+                g.appendChild(bgRect(W, H, stage.color, fixedTop));
+
+                // Transparent click-catcher — swallows clicks to prevent pass-through
+                // to ring nodes behind (bg has pointer-events: none). Rendered before
+                // interactive elements so they stay on top.
+                g.appendChild(
+                    $el("rect", {
+                        x: -W / 2,
+                        y: fixedTop,
+                        width: W,
+                        height: H,
+                        rx: 14,
+                        fill: "transparent",
+                    }),
+                );
+
+                const LX = -W / 2 + 10,
+                    RX = W / 2 - 10;
+
+                // Breadcrumb with clickable "back" link
+                const bcGroup = $el("g", {
+                    onclick: (e) => {
+                        e.stopPropagation();
+                        showLevel1();
+                    },
+                    style: "cursor:pointer;",
+                });
+                bcGroup.appendChild(
+                    $el("rect", {
+                        x: LX,
+                        y: -150,
+                        width: 80,
+                        height: 20,
+                        rx: 4,
+                        fill: "transparent",
+                    }),
+                );
+                bcGroup.appendChild(
+                    $el("text", {
+                        x: LX,
+                        y: -136,
+                        fill: "#89b4fa",
+                        "font-size": "14",
+                        textContent: "← 返回总览",
+                    }),
+                );
+                g.appendChild(bcGroup);
+
+                g.appendChild(
+                    $el("text", {
+                        x: LX + 100,
+                        y: -136,
+                        fill: "#6c7086",
+                        "font-size": "14",
+                        innerHTML: `&gt; <tspan fill="${stage.color}">${stage.icon} ${stage.label}</tspan>`,
+                    }),
+                );
+
+                // Title
+                g.appendChild(
+                    $el("text", {
+                        x: LX,
+                        y: -110,
+                        fill: stage.color,
+                        "font-size": "22",
+                        "font-weight": "bold",
+                        textContent: `${stage.icon} ${stage.label}`,
+                    }),
+                );
+
+                // Code ref (top right)
+                g.appendChild(
+                    $el("text", {
+                        x: RX,
+                        y: -110,
+                        "text-anchor": "end",
+                        fill: "#585b70",
+                        "font-size": "10",
+                        "font-family": "monospace",
+                        textContent: stage.code,
+                    }),
+                );
+
+                // Divider
+                g.appendChild(
+                    $el("line", {
+                        x1: LX,
+                        x2: RX,
+                        y1: -96,
+                        y2: -96,
+                        stroke: "#45475a",
+                        "stroke-width": "1",
+                    }),
+                );
+
+                // Sub-steps
+                stage.substeps.forEach((ss, i) => {
+                    const y = startY + i * rowH;
+                    const exp = expandedIdx === i;
+
+                    // Row bg
+                    g.appendChild(
+                        $el("rect", {
+                            x: LX,
+                            y,
+                            width: W - 20,
+                            height: rowH,
+                            rx: 5,
+                            fill: exp ? "#45475a" : "transparent",
+                            class: "substep-row",
+                            onclick: (e) => {
+                                e.stopPropagation();
+                                toggleSubstep(i);
+                            },
+                        }),
+                    );
+
+                    // Number
+                    g.appendChild(
+                        $el("text", {
+                            x: LX + 10,
+                            y: y + 28,
+                            fill: stage.color,
+                            "font-size": "16",
+                            textContent: `${i + 1}.`,
+                        }),
+                    );
+
+                    // Title
+                    g.appendChild(
+                        $el("text", {
+                            x: LX + 32,
+                            y: y + 28,
+                            fill: "#cdd6f4",
+                            "font-size": "16",
+                            textContent: ss.title,
+                        }),
+                    );
+
+                    // Indicator
+                    g.appendChild(
+                        $el("text", {
+                            x: RX,
+                            y: y + 28,
+                            "text-anchor": "end",
+                            fill: "#6c7086",
+                            "font-size": "16",
+                            textContent: exp ? "▾" : "▸",
+                        }),
+                    );
+
+                    // Divider between rows
+                    if (i < stage.substeps.length - 1) {
+                        g.appendChild(
+                            $el("line", {
+                                x1: LX + 10,
+                                x2: RX,
+                                y1: y + rowH + 1,
+                                y2: y + rowH + 1,
+                                stroke: "#45475a",
+                                "stroke-width": "0.5",
+                            }),
+                        );
+                    }
+                });
+
+                // Detail card if expanded
+                if (expandedIdx !== null && stage.substeps[expandedIdx]) {
+                    renderDetailCard(
+                        stage,
+                        stage.substeps[expandedIdx],
+                        startY + stage.substeps.length * rowH + 14,
+                    );
+                }
+
+                // Bottom tip — only show when card is not expanded (redundant otherwise)
+                if (!hasCard) {
+                    g.appendChild(
+                        $el("text", {
+                            x: 0,
+                            y: bottomContentY - 10,
+                            "text-anchor": "middle",
+                            fill: "#6c7086",
+                            "font-size": "13",
+                            textContent:
+                                "点击子步骤展开详情  ·  点击 ← 返回总览 返回总览",
+                        }),
+                    );
+                }
+            }
+
+            function renderDetailCard(stage, substep, cardTop) {
+                const g = document.getElementById("center-group");
+                const d = substep.detail;
+                const LX = -256,
+                    RW = 512;
+                const displayH = getCardHeight(stage, expandedIdx);
+
+                // Card group stops propagation
+                const cardG = $el("g", {
+                    onclick: (e) => {
+                        e.stopPropagation();
+                    },
+                });
+                g.appendChild(cardG);
+
+                cardG.appendChild(
+                    $el("rect", {
+                        x: LX,
+                        y: cardTop,
+                        width: RW,
+                        height: displayH,
+                        rx: 8,
+                        fill: "#1e1e2e",
+                        stroke: stage.color,
+                        "stroke-width": "0.8",
+                    }),
+                );
+
+                // foreignObject for rich HTML content with scrolling
+                const fo = document.createElementNS(SVG_NS, "foreignObject");
+                fo.setAttribute("x", LX + 4);
+                fo.setAttribute("y", cardTop + 4);
+                fo.setAttribute("width", RW - 8);
+                fo.setAttribute("height", displayH - 8);
+
+                let html =
+                    "<div xmlns=\"http://www.w3.org/1999/xhtml\" style=\"padding:10px 12px;color:#cdd6f4;font-size:13px;line-height:1.5;font-family:-apple-system,'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif;height:100%;overflow-y:auto;box-sizing:border-box;\" onclick=\"event.stopPropagation()\">";
+
+                // Section: Process
+                html +=
+                    '<div style="color:' +
+                    stage.color +
+                    ';font-weight:bold;font-size:14px;margin-bottom:6px;">📋 详细流程</div>';
+                html +=
+                    '<p style="color:#a6adc8;font-size:13px;line-height:1.65;margin:0 0 12px 0;">' +
+                    escHtml(d.process) +
+                    "</p>";
+
+                // Section: Examples
+                html +=
+                    '<div style="color:#6c7086;font-size:11px;margin-bottom:6px;">📎 代码示例（点击展开）</div>';
+
+                d.examples.forEach((ex, i) => {
+                    const key = stage.id + "-" + expandedIdx + "-" + i;
+                    const exp = expandedExampleCodes.has(key);
+                    html +=
+                        "<div onclick=\"event.stopPropagation();window._toggleEx('" +
+                        key +
+                        '\')" style="background:' +
+                        (exp ? "#45475a" : "#313244") +
+                        ';border-radius:4px;padding:5px 8px;margin-bottom:3px;cursor:pointer;font-size:12px;color:#cdd6f4;">' +
+                        (exp ? "▾" : "▸") +
+                        " " +
+                        escHtml(ex.title) +
+                        "</div>";
+                    if (exp) {
+                        html +=
+                            "<pre style=\"background:#11111b;color:#a6adc8;padding:8px 10px;border-radius:4px;margin:0 0 5px 0;font-size:10px;line-height:1.35;overflow-x:auto;white-space:pre-wrap;font-family:'SF Mono','Fira Code','Cascadia Code',monospace;\">" +
+                            escHtml(ex.code) +
+                            "</pre>";
+                    }
+                });
+
+                html += "</div>";
+                fo.innerHTML = html;
+                cardG.appendChild(fo);
+            }
+
+            // ============================================================
+            // Level Navigation
+            // ============================================================
+
+            function setLayerOrder(centerOnTop) {
+                const svg = document.getElementById("ring-svg");
+                const centerG = document.getElementById("center-group");
+                const connG = document.getElementById("connectors-group");
+                const nodesG = document.getElementById("nodes-group");
+                if (centerOnTop) {
+                    // center on top: nodes → connectors → center (center rendered last = on top)
+                    svg.insertBefore(connG, centerG);
+                    svg.insertBefore(nodesG, connG);
+                } else {
+                    // ring on top: center → connectors → nodes
+                    svg.insertBefore(connG, nodesG);
+                    svg.insertBefore(centerG, connG);
+                }
+            }
+
+            function showLevel1() {
+                currentStage = null;
+                expandedIdx = null;
+                setLayerOrder(false); // ring on top
+                renderRing(null);
+                renderCenterDefault();
+            }
+
+            function showLevel2(stageId) {
+                currentStage = STAGES.find((s) => s.id === stageId);
+                expandedIdx = null;
+                setLayerOrder(true); // center on top
+                renderRing(stageId);
+                renderCenterSubSteps(currentStage);
+            }
+
+            function toggleSubstep(idx) {
+                if (expandedIdx === idx) {
+                    expandedIdx = null;
+                } else {
+                    expandedIdx = idx;
+                    expandedExampleCodes.clear();
+                }
+                if (currentStage) renderCenterSubSteps(currentStage);
+            }
+
+            // ============================================================
+            // Init
+            // ============================================================
+
+            showLevel1();
+        </script>
+    </body>
 </html>
