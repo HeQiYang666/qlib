@@ -82,6 +82,7 @@ port_analysis_config: &port_analysis_config
         benchmark: *benchmark
         exchange_kwargs:
             limit_threshold: ["$limit_buy", "$limit_sell"]
+            subscribe_fields: ["$is_st"]
             codes: *market
             deal_price: close
             open_cost: 0.0005
