@@ -200,7 +200,7 @@ def cumulative_return_graph(
 
                 # backtest parameters
                 bparas = {}
-                bparas['limit_threshold'] = 0.095
+                bparas['limit_threshold'] = ("$limit_buy", "$limit_sell")
                 bparas['account'] = 1000000000
 
                 sparas = {}

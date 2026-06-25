@@ -39,6 +39,7 @@ test-output.xml
 
 # special software
 mlruns/
+backtest_results/
 
 tags
 
@@ -51,3 +52,4 @@ tags
 ./pretrain
 .idea/
 .aider*
+.superpowers/

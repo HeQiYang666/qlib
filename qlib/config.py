@@ -32,7 +32,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class MLflowSettings(BaseSettings):
-    uri: str = "file:" + str(Path(os.getcwd()).resolve() / "mlruns")
+    uri: str = "sqlite:///" + str(Path(os.getcwd()).resolve() / "mlruns" / "mlflow.db")
     default_exp_name: str = "Experiment"
 
 
@@ -296,7 +296,7 @@ HIGH_FREQ_CONFIG = {
 _default_region_config = {
     REG_CN: {
         "trade_unit": 100,
-        "limit_threshold": 0.095,
+        "limit_threshold": ("$limit_buy", "$limit_sell"),
         "deal_price": "close",
     },
     REG_US: {

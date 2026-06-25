@@ -177,7 +177,7 @@ class Exchange:
 
         necessary_fields = {self.buy_price, self.sell_price, "$close", "$change", "$factor", "$volume"}
         if self.limit_type == self.LT_TP_EXP:
-            assert isinstance(limit_threshold, tuple)
+            assert isinstance(limit_threshold, (tuple, list))
             for exp in limit_threshold:
                 necessary_fields.add(exp)
         all_fields = list(necessary_fields | set(vol_lt_fields) | set(subscribe_fields))
@@ -259,9 +259,9 @@ class Exchange:
     LT_FLT = "float"  # float:  the trading limitation is based on `abs($change) < limit_threshold`
     LT_NONE = "none"  # none:  there is no trading limitation
 
-    def _get_limit_type(self, limit_threshold: Union[tuple, float, None]) -> str:
+    def _get_limit_type(self, limit_threshold: Union[tuple, list, float, None]) -> str:
         """get limit type"""
-        if isinstance(limit_threshold, tuple):
+        if isinstance(limit_threshold, (tuple, list)):
             return self.LT_TP_EXP
         elif isinstance(limit_threshold, float):
             return self.LT_FLT

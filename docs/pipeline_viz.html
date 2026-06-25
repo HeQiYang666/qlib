@@ -223,7 +223,7 @@
                     items: [
                         {
                             label: "数据处理",
-                            detail: "加载行情数据，计算 Alpha158",
+                            detail: "加载行情数据，计算 ALPHA20 ",
                         },
                         {
                             label: "模型训练",
@@ -517,15 +517,15 @@
                             title: "加载特征数据",
                             detail: {
                                 process:
-                                    "Docker 容器内启动 Qlib。通过 Qlib 表达式引擎 D.features() 并行计算 20 个基础 Alpha158 特征（如 CORD10、RESI5、RSQR20 等，均为预定义的数学表达式）。同时从 combined_factors_df.parquet 加载自定义因子。两组特征按列合并，构造完整的特征矩阵。如果存在 SOTA PyTorch 模型，还会加载 model.py。",
+                                    "Docker 容器内启动 Qlib。通过 Qlib 表达式引擎 D.features() 并行计算 20 个基础特征（RD-Agent ALPHA20，如 CORD10、RESI5、RSQR20 等，均为预定义的数学表达式）。同时从 combined_factors_df.parquet 加载自定义因子。两组特征按列合并，构造完整的特征矩阵。如果存在 SOTA PyTorch 模型，还会加载 model.py。",
                                 examples: [
                                     {
-                                        title: "20个 Alpha158 基础特征",
-                                        code: '// qlib表达式 → 自动并行计算\nBASE_ALPHA158 = {\n  "CORD10": "Corr($close/Ref($close,1),\n              Log($volume/Ref($volume,1)+1), 10)",\n  "RESI5": "Resi($close, 5)/$close",\n  "RSQR20": "Rsquare($close, 20)",\n  "STD5": "Std($close, 5)/$close",\n  "WVMA60": "Std(Abs($close/Ref($close,1)-1)*$volume,60)\n              /(Mean(...)+1e-12)",\n  ... // 共20个\n}\n\n// 执行\nfeatures = D.features(instruments, expressions,\n                       start_time, end_time)',
+                                        title: "20个基础特征 (ALPHA20)",
+                                        code: '// qlib表达式 → 自动并行计算\nBASE_FEATURES = {\n  "CORD10": "Corr($close/Ref($close,1),\n              Log($volume/Ref($volume,1)+1), 10)",\n  "RESI5": "Resi($close, 5)/$close",\n  "RSQR20": "Rsquare($close, 20)",\n  "STD5": "Std($close, 5)/$close",\n  "WVMA60": "Std(Abs($close/Ref($close,1)-1)*$volume,60)\n              /(Mean(...)+1e-12)",\n  ... // 共20个（与 RD-Agent ALPHA20 一致）\n}\n\n// 执行\nfeatures = D.features(instruments, expressions,\n                       start_time, end_time)',
                                     },
                                     {
                                         title: "特征矩阵合并",
-                                        code: "// Alpha158 特征 (20列)\nbase_df  = D.features(instruments, alpha158_exprs, ...)\n\n// 自定义因子 (来自 combined_factors_df.parquet)\ncustom_df = pd.read_parquet('combined_factors_df.parquet')\n\n// 合并: 按 (datetime, instrument) 对齐\nfull_features = pd.concat([base_df, custom_df], axis=1)",
+                                        code: "// 基础特征 (20列)\nbase_df  = D.features(instruments, base_exprs, ...)\n\n// 自定义因子 (来自 combined_factors_df.parquet)\ncustom_df = pd.read_parquet('combined_factors_df.parquet')\n\n// 合并: 按 (datetime, instrument) 对齐\nfull_features = pd.concat([base_df, custom_df], axis=1)",
                                     },
                                 ],
                             },
@@ -538,7 +538,7 @@
                                 examples: [
                                     {
                                         title: "DataHandlerLP 配置",
-                                        code: '// conf_combined_factors.yaml\nhandler:\n    class: DataHandlerLP\n    module_path: qlib.contrib.data.handler\n    kwargs:\n        start_time: "2020-01-01"\n        end_time: "2023-12-31"\n        fit_start_time: "2020-01-01"\n        fit_end_time: "2022-06-30"\n        instruments: "csi300"\n        # Alpha158 + 自定义因子的表达式列表\n        # DataHandlerLP 自动按字母序排列',
+                                        code: '// conf_combined_factors.yaml\nhandler:\n    class: DataHandlerLP\n    module_path: qlib.contrib.data.handler\n    kwargs:\n        start_time: "2020-01-01"\n        end_time: "2023-12-31"\n        fit_start_time: "2020-01-01"\n        fit_end_time: "2022-06-30"\n        instruments: "csi300"\n        # 20个基础特征 + 自定义因子的表达式列表\n        # DataHandlerLP 自动按字母序排列',
                                     },
                                     {
                                         title: "字母序排列的重要性",
