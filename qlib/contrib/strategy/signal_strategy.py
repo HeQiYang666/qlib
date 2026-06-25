@@ -88,6 +88,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         hold_thresh=1,
         only_tradable=False,
         forbid_all_trade_at_limit=True,
+        st_field="$is_st",
         **kwargs,
     ):
         """
@@ -125,6 +126,10 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             else:
 
                 strategy will sell at limit up and buy ad limit down.
+        st_field : str
+            feature flagging same-day ST status (1 ST / 0 not). When ``only_tradable`` is True, names
+            that are ST on the trading day are excluded from buying (selling ST holdings stays allowed).
+            The field must be preloaded via ``exchange_kwargs.subscribe_fields`` to be effective.
         """
         super().__init__(**kwargs)
         self.topk = topk
@@ -134,6 +139,18 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         self.hold_thresh = hold_thresh
         self.only_tradable = only_tradable
         self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
+        self.st_field = st_field
+
+    def _is_st(self, stock_id, start_time, end_time) -> bool:
+        # `$is_st` rides the exchange's preloaded quote (declare it in exchange_kwargs.subscribe_fields),
+        # so this is an O(1) memory lookup -- the same path limit_buy/limit_sell use. If the field was not
+        # subscribed it is absent from the quote, so ST exclusion is a no-op. None/NaN means no flag.
+        if self.st_field not in getattr(self.trade_exchange, "all_fields", []):
+            return False
+        val = self.trade_exchange.get_quote_info(
+            stock_id=stock_id, start_time=start_time, end_time=end_time, field=self.st_field
+        )
+        return val is not None and not pd.isna(val) and val > 0.5
 
     def generate_trade_decision(self, execute_result=None):
         # get the number of trading step finished, trade_step can be [0, 1, 2, ..., trade_len - 1]
@@ -154,6 +171,10 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 cur_n = 0
                 res = []
                 for si in reversed(li) if reverse else li:
+                    # reverse=True is the sell path (via get_last_n); ST holdings must stay sellable, so
+                    # only exclude ST on the buy path (reverse=False)
+                    if not reverse and self._is_st(si, trade_start_time, trade_end_time):
+                        continue
                     if self.trade_exchange.is_stock_tradable(
                         stock_id=si, start_time=trade_start_time, end_time=trade_end_time
                     ):
